@@ -1,0 +1,280 @@
+/**
+ * CLI entrypoint for the Polymarket PnL forensic auditor.
+ *
+ * Phase 0 subcommands:
+ *   resolve            Resolve the 5 subject wallets (usernames -> proxy addresses).
+ *   recon [opts]       Download one wallet's raw fills/activity, read a market's
+ *                      settlement, and reconstruct maker/taker on-chain for one tx,
+ *                      dumping raw structures so we can confirm the data has the
+ *                      shape the rest of the spec assumes (spec §7 checkpoint).
+ *
+ * Global: --dry-run prints the request plan and exits without calling anything.
+ *
+ * Run: `node src/cli.ts <command> [options]`
+ */
+import { mkdir, writeFile } from "node:fs/promises";
+import { getActivity, getTrades } from "./clients/data.ts";
+import { getMarketSettlement } from "./clients/clob.ts";
+import { extractWalletFills, getTransactionReceipt } from "./clients/onchain.ts";
+import { getRequestCount as reqCount } from "./clients/http.ts";
+import { polygonRpcUrls } from "./config/constants.ts";
+import { resolveSubjects } from "./ingest/resolve-wallets.ts";
+
+const OUT_DIR = "output/phase0";
+const DEFAULT_WALLET = "0xfcdc071df7080c214196bb0b3b751e5417f9d8e3"; // neversmiling (resolved)
+
+interface Args {
+  command: string;
+  dryRun: boolean;
+  wallet?: string;
+  tx?: string;
+  limit: number;
+}
+
+function parseArgs(argv: string[]): Args {
+  const a: Args = { command: argv[0] ?? "help", dryRun: false, limit: 10 };
+  for (let i = 1; i < argv.length; i++) {
+    const t = argv[i];
+    if (t === "--dry-run") a.dryRun = true;
+    else if (t === "--wallet") a.wallet = argv[++i]?.toLowerCase();
+    else if (t === "--tx") a.tx = argv[++i];
+    else if (t === "--limit") a.limit = Number(argv[++i]) || 10;
+  }
+  return a;
+}
+
+async function dump(name: string, data: unknown): Promise<void> {
+  await mkdir(OUT_DIR, { recursive: true });
+  const path = `${OUT_DIR}/${name}`;
+  await writeFile(path, JSON.stringify(data, null, 2));
+  console.log(`  ↳ wrote ${path}`);
+}
+
+function hr(): void {
+  console.log("─".repeat(72));
+}
+
+// ---------------------------------------------------------------------------
+// resolve
+// ---------------------------------------------------------------------------
+async function cmdResolve(args: Args): Promise<void> {
+  console.log("PHASE 0 — resolve subject wallets\n");
+  if (args.dryRun) {
+    console.log("[dry-run] would issue, per subject:");
+    console.log("  • usernames: 1× Gamma /public-search, then 1× Gamma /public-profile (round-trip),");
+    console.log("               + up to 1× Data /v1/leaderboard fallback if no exact match");
+    console.log("  • addresses: 1× Gamma /public-profile");
+    console.log(`  ~ ${1}–${3} requests × 5 subjects ≈ 5–15 requests total. No calls made.`);
+    return;
+  }
+
+  const resolved = await resolveSubjects();
+  hr();
+  console.log("id  status      address                                     name/roundtrip   method");
+  hr();
+  for (const r of resolved) {
+    const addr = r.address ?? "—".padEnd(42);
+    const rt = (r.roundTripName ?? "—").padEnd(15);
+    console.log(`${String(r.id).padEnd(3)} ${r.status.padEnd(11)} ${addr.padEnd(43)} ${rt} ${r.method}`);
+    for (const n of r.notes) console.log(`      ⚠ ${n}`);
+  }
+  hr();
+  const usable = resolved.filter((r) => r.address);
+  const excluded = resolved.filter((r) => !r.address);
+  console.log(`\n${usable.length}/5 wallets usable; ${excluded.length} excluded.`);
+  if (excluded.length) {
+    console.log(`Excluded (documented, per spec §1): ${excluded.map((e) => e.label).join(", ")}`);
+  }
+  await dump("resolved-wallets.json", resolved);
+  console.log(`\nRequests made: ${reqCount()}`);
+}
+
+// ---------------------------------------------------------------------------
+// recon
+// ---------------------------------------------------------------------------
+interface FillInterpretation {
+  role: string;
+  shares: number; // outcome-token amount on this leg (the non-collateral side)
+  cash: number; // collateral amount on this leg
+  impliedPrice: number; // cash/shares — MAY be the outcome COMPLEMENT of the /trades price
+  fee: number;
+  counterparty: string;
+}
+
+/**
+ * Split an OrderFilled leg into token vs collateral sides (asset id 0 == collateral).
+ * We deliberately do NOT infer BUY/SELL here: the economic side/price come from
+ * the /trades record. On-chain is used only as a role + fee oracle. The implied
+ * price can be the complement of the /trades price (taker orders match against the
+ * opposite outcome), so it is reported but not reconciled.
+ */
+function interpret(fill: {
+  role: string;
+  makerAssetId: bigint;
+  takerAssetId: bigint;
+  makerAmount: number;
+  takerAmount: number;
+  fee: number;
+  counterparty: string;
+}): FillInterpretation {
+  const tokenOnTakerSide = fill.makerAssetId === 0n; // collateral on maker side => token on taker side
+  const shares = tokenOnTakerSide ? fill.takerAmount : fill.makerAmount;
+  const cash = tokenOnTakerSide ? fill.makerAmount : fill.takerAmount;
+  const impliedPrice = shares > 0 ? cash / shares : 0;
+  return { role: fill.role, shares, cash, impliedPrice, fee: fill.fee, counterparty: fill.counterparty };
+}
+
+async function cmdRecon(args: Args): Promise<void> {
+  const wallet = args.wallet ?? DEFAULT_WALLET;
+  console.log(`PHASE 0 — recon for wallet ${wallet}\n`);
+
+  if (args.dryRun) {
+    console.log("[dry-run] recon would issue:");
+    console.log(`  • 3× Data /trades (takerOnly=false, takerOnly=true, and an older window; limit ${args.limit})`);
+    console.log("  • 1× Data /activity (limit 100)");
+    console.log("  • up to 8× CLOB /markets/<conditionId> (until a resolved market is found)");
+    console.log("  • 1× eth_getTransactionReceipt (Polygon RPC, with failover)");
+    console.log(`  ≈ 5–10 requests total. RPC endpoints: ${polygonRpcUrls().length} configured. No calls made.`);
+    return;
+  }
+
+  // 1) Fills — full (takerOnly=false) vs taker-only, to test the cheap set-diff signal.
+  const allFills = await getTrades({ user: wallet, takerOnly: false, limit: args.limit });
+  const takerFills = await getTrades({ user: wallet, takerOnly: true, limit: args.limit });
+  // For the settlement demo, look ~1h before the latest fill so the short (5–15 min)
+  // markets have resolved. Reference time comes from the DATA, not the container clock.
+  const latestTs = allFills[0]?.timestamp ?? 0;
+  const olderFills = latestTs
+    ? await getTrades({ user: wallet, takerOnly: false, limit: args.limit, end: latestTs - 3600 })
+    : [];
+  console.log("── Fills (/trades) ──────────────────────────────────────────────────");
+  console.log(`  takerOnly=false → ${allFills.length} rows (all fills)`);
+  console.log(`  takerOnly=true  → ${takerFills.length} rows (taker fills only)`);
+  console.log("  note: both hit the row limit, so counts alone don't give the split — on-chain is ground truth (below)");
+  if (allFills[0]) {
+    const t = allFills[0];
+    console.log(`  sample fill: ${t.side} ${t.size} @ ${t.price}  "${t.title}"`);
+    console.log(`               conditionId=${t.conditionId}`);
+    console.log(`               tx=${t.transactionHash}`);
+  }
+
+  // 2) Activity — confirm REDEEM/settlement rows exist and their shape.
+  const activity = await getActivity({ user: wallet, limit: 100 });
+  const typeCounts: Record<string, number> = {};
+  for (const r of activity) typeCounts[r.type] = (typeCounts[r.type] ?? 0) + 1;
+  console.log("\n── Activity (/activity) ─────────────────────────────────────────────");
+  console.log(`  last ${activity.length} rows, types: ${JSON.stringify(typeCounts)}`);
+  const redeem = activity.find((r) => r.type === "REDEEM");
+  if (redeem) {
+    console.log(`  REDEEM sample: usdcSize=${redeem.usdcSize} (⇒ compute settlement from outcome×net position, not this field)`);
+  }
+
+  // 3) Settlement — CLOB /markets, searching recent markets for a resolved one.
+  console.log("\n── Settlement (CLOB /markets) ───────────────────────────────────────");
+  const uniqueConds = [...new Set([...olderFills, ...allFills].map((f) => f.conditionId))].slice(0, 8);
+  let settlement = null;
+  for (const cid of uniqueConds) {
+    const s = await getMarketSettlement(cid);
+    if (s?.resolved) {
+      settlement = s;
+      break;
+    }
+  }
+  if (settlement) {
+    const wt = settlement.tokens.map((t) => `${t.outcome}=${t.winner ? "WON" : t.price}`).join(", ");
+    console.log(`  resolved market "${settlement.question}"`);
+    console.log(`    conditionId=${settlement.conditionId}`);
+    console.log(`    winner: outcomeIndex=${settlement.winningOutcomeIndex} [${wt}]`);
+  } else {
+    console.log(`  none of ${uniqueConds.length} sampled markets resolved yet (short windows may be freshly open)`);
+  }
+
+  // 4) Maker/taker reconstruction — the H2 method — on one real tx.
+  console.log("\n── Maker/taker reconstruction (on-chain OrderFilled) ────────────────");
+  const txHash = args.tx ?? allFills[0]?.transactionHash;
+  let onchainFills: FillInterpretation[] = [];
+  let rawFills: unknown[] = [];
+  if (!txHash) {
+    console.log("  no tx available to decode");
+  } else {
+    console.log(`  tx ${txHash}`);
+    console.log(`  RPC: ${polygonRpcUrls()[0]} (+${polygonRpcUrls().length - 1} fallback)`);
+    const receipt = await getTransactionReceipt(txHash);
+    if (!receipt) {
+      console.log("  receipt not found");
+    } else {
+      const fills = extractWalletFills(receipt, wallet);
+      rawFills = fills.map((f) => ({ ...f, makerAssetId: f.makerAssetId.toString(), takerAssetId: f.takerAssetId.toString() }));
+      onchainFills = fills.map(interpret);
+      console.log(`  block ${parseInt(receipt.blockNumber, 16)}, ${receipt.logs.length} logs; ${fills.length} leg(s) involve this wallet`);
+      for (const f of onchainFills) {
+        console.log(
+          `    role=${f.role.toUpperCase().padEnd(5)} shares=${f.shares}  cash=${f.cash}  impliedPx=${f.impliedPrice.toFixed(4)}  fee=${f.fee}`,
+        );
+      }
+      // Reconcile against the /trades record: aggregate legs; reconcile SHARES only
+      // (price/side come from /trades; on-chain gives role + fee).
+      const matchTrade = allFills.find((t) => t.transactionHash === txHash);
+      if (matchTrade && onchainFills.length) {
+        const totShares = onchainFills.reduce((s, f) => s + f.shares, 0);
+        const totFee = onchainFills.reduce((s, f) => s + f.fee, 0);
+        const roles = [...new Set(onchainFills.map((f) => f.role))].join("+");
+        const sizeOk = Math.abs(totShares - matchTrade.size) < 0.05;
+        console.log(
+          `  aggregate: role=${roles}, shares=${totShares.toFixed(2)} vs /trades size=${matchTrade.size} ${sizeOk ? "✓" : "✗"}, total fee=${totFee.toFixed(6)}`,
+        );
+        console.log(
+          `  economic terms from /trades: ${matchTrade.side} @ ${matchTrade.price} (on-chain impliedPx may be the complement ${(1 - matchTrade.price).toFixed(2)})`,
+        );
+        if (roles === "maker") console.log(`  H2 note: role=MAKER; per-leg fee=${totFee.toFixed(6)} (makers pay 0 — validated).`);
+        if (roles.includes("taker"))
+          console.log("  H2 note: role=TAKER; taker fee decode is PROVISIONAL (tx-level fee sits on the aggregate leg — see docs/phase0-report.md).");
+        const inTakerSet = takerFills.some((t) => t.transactionHash === txHash);
+        console.log(`  cross-check (inconclusive, paging-confounded): Data-API takerOnly=true ${inTakerSet ? "INCLUDES" : "excludes"} this tx`);
+      }
+    }
+  }
+
+  await dump(`recon-${wallet.slice(0, 10)}.json`, {
+    wallet,
+    fetchedAt: new Date().toISOString(),
+    counts: { allFills: allFills.length, takerFills: takerFills.length, activity: activity.length },
+    activityTypeCounts: typeCounts,
+    sampleFills: allFills,
+    settlement,
+    onchain: { txHash, fills: rawFills, interpreted: onchainFills },
+  });
+  console.log(`\nRequests made: ${reqCount()}`);
+}
+
+// ---------------------------------------------------------------------------
+function help(): void {
+  console.log(`Polymarket PnL forensic auditor — Phase 0 CLI
+
+Usage:
+  node src/cli.ts resolve [--dry-run]
+  node src/cli.ts recon [--wallet 0x..] [--tx 0x..] [--limit N] [--dry-run]
+
+Environment:
+  POLYGON_RPC_URL   optional read-only Polygon RPC (provider key = reliable backfill)
+`);
+}
+
+async function main(): Promise<void> {
+  const args = parseArgs(process.argv.slice(2));
+  switch (args.command) {
+    case "resolve":
+      await cmdResolve(args);
+      break;
+    case "recon":
+      await cmdRecon(args);
+      break;
+    default:
+      help();
+  }
+}
+
+main().catch((err) => {
+  console.error("\nFATAL:", err instanceof Error ? err.message : err);
+  process.exit(1);
+});

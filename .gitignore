@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Raw data cache (append-only, re-fetchable — never committed; spec §2)
+data/
+
+# Generated analysis outputs (report + CSVs + recon dumps)
+output/
+
+# Local env / secrets (e.g. POLYGON_RPC_URL provider key — never a wallet key)
+.env
+.env.*
+!.env.example
+
+# Logs & OS noise
+*.log
+.DS_Store

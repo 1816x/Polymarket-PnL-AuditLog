@@ -1,0 +1,23 @@
+{
+  "name": "polymarket-pnl-audit",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Read-only forensic auditor of realized PnL for Polymarket short-term Up/Down bot wallets",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "cli": "node src/cli.ts",
+    "resolve": "node src/cli.ts resolve",
+    "recon": "node src/cli.ts recon",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
