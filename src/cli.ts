@@ -19,6 +19,12 @@ import { extractWalletFills, getTransactionReceipt } from "./clients/onchain.ts"
 import { getRequestCount as reqCount } from "./clients/http.ts";
 import { polygonRpcUrls } from "./config/constants.ts";
 import { resolveSubjects } from "./ingest/resolve-wallets.ts";
+import type { ResolvedSubject } from "./ingest/resolve-wallets.ts";
+import { openDb } from "./store/schema.ts";
+import { Repository } from "./store/repository.ts";
+import { ingestFills } from "./ingest/fetch-fills.ts";
+import { ingestActivity } from "./ingest/fetch-activity.ts";
+import { collectVolume, formatVolume, sampleSettlement } from "./ingest/report.ts";
 
 const OUT_DIR = "output/phase0";
 const DEFAULT_WALLET = "0xfcdc071df7080c214196bb0b3b751e5417f9d8e3"; // neversmiling (resolved)
@@ -29,18 +35,49 @@ interface Args {
   wallet?: string;
   tx?: string;
   limit: number;
+  maxPages: number;
+  delayMs: number;
+  sample: number;
+  fillsOnly: boolean;
+  activityOnly: boolean;
 }
 
 function parseArgs(argv: string[]): Args {
-  const a: Args = { command: argv[0] ?? "help", dryRun: false, limit: 10 };
+  const a: Args = {
+    command: argv[0] ?? "help",
+    dryRun: false,
+    limit: 10,
+    maxPages: 1_000_000,
+    delayMs: 100,
+    sample: 150,
+    fillsOnly: false,
+    activityOnly: false,
+  };
   for (let i = 1; i < argv.length; i++) {
     const t = argv[i];
     if (t === "--dry-run") a.dryRun = true;
     else if (t === "--wallet") a.wallet = argv[++i]?.toLowerCase();
     else if (t === "--tx") a.tx = argv[++i];
     else if (t === "--limit") a.limit = Number(argv[++i]) || 10;
+    else if (t === "--max-pages") a.maxPages = Number(argv[++i]) || a.maxPages;
+    else if (t === "--delay") a.delayMs = Number(argv[++i]) || 0;
+    else if (t === "--sample") a.sample = Number(argv[++i]) || 0;
+    else if (t === "--fills-only") a.fillsOnly = true;
+    else if (t === "--activity-only") a.activityOnly = true;
   }
   return a;
+}
+
+/** Resolved subjects that are usable (have an address), optionally filtered to one wallet. */
+async function usableWallets(filter?: string): Promise<ResolvedSubject[]> {
+  const resolved = await resolveSubjects();
+  let usable = resolved.filter((r) => r.address);
+  if (filter) usable = usable.filter((r) => r.address === filter);
+  return usable;
+}
+
+function stamp(msg: string): void {
+  console.log(`[${new Date().toISOString().slice(11, 19)}] ${msg}`);
 }
 
 async function dump(name: string, data: unknown): Promise<void> {
@@ -248,12 +285,84 @@ async function cmdRecon(args: Args): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// ingest (Phase 1) — full resumable download of fills + non-trade activity
+// ---------------------------------------------------------------------------
+async function cmdIngest(args: Args): Promise<void> {
+  const wallets = await usableWallets(args.wallet);
+  console.log(`PHASE 1 — ingest ${wallets.length} wallet(s)\n`);
+  const db = openDb();
+  const repo = new Repository(db);
+
+  if (args.dryRun) {
+    console.log("[dry-run] plan — end-cursor time pagination, append-only raw cache, resumable:");
+    for (const w of wallets) {
+      const fc = repo.getCheckpoint(`fills:${w.address}`);
+      const ac = repo.getCheckpoint(`activity:${w.address}`);
+      const st = (c: ReturnType<Repository["getCheckpoint"]>) =>
+        !c ? "not started" : c.done ? `done (${c.rows} rows)` : `resume @${c.cursor} (${c.rows} rows so far)`;
+      console.log(`  ${w.label} ${w.address}`);
+      console.log(`    fills    (/trades  10000/pg): ${st(fc)}`);
+      console.log(`    activity (/activity 500/pg) : ${st(ac)}`);
+    }
+    console.log("\nNo calls made.");
+    db.close();
+    return;
+  }
+
+  for (const w of wallets) {
+    const addr = w.address as string;
+    stamp(`▶ ${w.label} ${addr}`);
+    if (!args.activityOnly) {
+      const r = await ingestFills(repo, addr, { maxPages: args.maxPages, delayMs: args.delayMs, log: stamp });
+      stamp(`  fills: ${r.rows} rows / ${r.pages} pages / done=${r.done}`);
+    }
+    if (!args.fillsOnly) {
+      const r = await ingestActivity(repo, addr, { maxPages: args.maxPages, delayMs: args.delayMs, log: stamp });
+      stamp(`  activity: ${r.rows} rows / ${r.pages} pages / done=${r.done}`);
+    }
+  }
+
+  const vols = [];
+  for (const w of wallets) {
+    const v = collectVolume(repo, w.address as string, w.label);
+    if (args.sample > 0 && v.markets > 0) {
+      stamp(`sampling settlement for ${w.label} (n=${args.sample})…`);
+      v.settlementSample = await sampleSettlement(repo, w.address as string, args.sample);
+    }
+    vols.push(v);
+  }
+  console.log("\n" + formatVolume(vols));
+  console.log(`\nRequests this run: ${reqCount()}`);
+  db.close();
+}
+
+// ---------------------------------------------------------------------------
+// volume — print the report from the store (pass --sample 0 to skip network)
+// ---------------------------------------------------------------------------
+async function cmdVolume(args: Args): Promise<void> {
+  const wallets = await usableWallets(args.wallet);
+  const db = openDb();
+  const repo = new Repository(db);
+  const vols = [];
+  for (const w of wallets) {
+    const v = collectVolume(repo, w.address as string, w.label);
+    if (args.sample > 0 && v.markets > 0) v.settlementSample = await sampleSettlement(repo, w.address as string, args.sample);
+    vols.push(v);
+  }
+  console.log(formatVolume(vols));
+  db.close();
+}
+
+// ---------------------------------------------------------------------------
 function help(): void {
-  console.log(`Polymarket PnL forensic auditor — Phase 0 CLI
+  console.log(`Polymarket PnL forensic auditor — CLI
 
 Usage:
   node src/cli.ts resolve [--dry-run]
-  node src/cli.ts recon [--wallet 0x..] [--tx 0x..] [--limit N] [--dry-run]
+  node src/cli.ts recon   [--wallet 0x..] [--tx 0x..] [--limit N] [--dry-run]
+  node src/cli.ts ingest  [--wallet 0x..] [--max-pages N] [--delay MS]
+                          [--fills-only|--activity-only] [--sample N] [--dry-run]
+  node src/cli.ts volume  [--wallet 0x..] [--sample N]   # report from store (--sample 0 = offline)
 
 Environment:
   POLYGON_RPC_URL   optional read-only Polygon RPC (provider key = reliable backfill)
@@ -268,6 +377,12 @@ async function main(): Promise<void> {
       break;
     case "recon":
       await cmdRecon(args);
+      break;
+    case "ingest":
+      await cmdIngest(args);
+      break;
+    case "volume":
+      await cmdVolume(args);
       break;
     default:
       help();

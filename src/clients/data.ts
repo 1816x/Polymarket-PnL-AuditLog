@@ -73,6 +73,8 @@ export interface ActivityQuery {
   limit?: number;
   start?: number;
   end?: number;
+  /** Comma-joined activity types to include, e.g. "REDEEM,MERGE,REWARD". Omit for all. */
+  type?: string;
 }
 
 /** Fetch a page of activity rows for a wallet (limit capped at 500 by the API). */
@@ -81,6 +83,7 @@ export async function getActivity(q: ActivityQuery): Promise<Activity[]> {
   p.set("limit", String(Math.min(q.limit ?? 100, 500)));
   if (q.start !== undefined) p.set("start", String(q.start));
   if (q.end !== undefined) p.set("end", String(q.end));
+  if (q.type) p.set("type", q.type);
   const raw = await getJson(`${DATA_API}/activity?${p.toString()}`, { label: `data /activity ${q.user}` });
   return z.array(ActivitySchema).parse(raw);
 }
