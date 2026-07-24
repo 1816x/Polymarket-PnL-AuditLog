@@ -30,14 +30,14 @@ not an advertisement — see the hard rigor rules in the spec (§8).
   read-only infrastructure, not a wallet key.
 - We are **not** building a bot and **not** trading.
 
-## Status: Phase 0 (Reconnaissance) — complete
+## Status: Phase 1 (Ingest) — complete
 
-Per the spec's phased workflow (§7), work stops for review after each phase. Phase 0
-verified every external assumption against live Polymarket docs / on-chain / live API
-calls before more code is written. See **[`docs/phase0-report.md`](docs/phase0-report.md)**
-for the full findings and the go/no-go for Phase 1.
+Per the spec's phased workflow (§7), work stops for review after each phase.
+Reports: **[`docs/phase0-report.md`](docs/phase0-report.md)** (recon / go-no-go) and
+**[`docs/phase1-report.md`](docs/phase1-report.md)** (ingest / volume). **No PnL is
+computed yet** — that is Phase 2.
 
-Headline results:
+Phase 0 (reconnaissance) headline:
 
 - The read-only premise **holds** — the whole pipeline needs no auth and no keys.
 - 4 of 5 subject wallets resolve cleanly; **`BadFallen` does not resolve** and is excluded
@@ -45,9 +45,16 @@ Headline results:
 - Two spec assumptions proved **false** and are handled: (1) maker/taker is **not** in any
   public per-wallet API — it is reconstructed from on-chain `OrderFilled` events; (2) a
   **CLOB V2 migration (Apr 28 2026)** bifurcates contracts/collateral/data, so the tool is
-  date-partitioned.
-- The maker/taker on-chain reconstruction is **validated** on real fills (both roles),
-  reconciling share amounts to the Data API exactly.
+  date-partitioned. Maker/taker reconstruction is validated on real fills (both roles).
+
+Phase 1 (ingest) headline — **~19.9M fills** downloaded to a resumable cache:
+
+- **The bots essentially don't sell** — 131 sells in 19.9M fills; positions unwind via
+  REDEEM + MERGE. The article's buy-only claim is confirmed (spec §3.2).
+- **~585k USDC of *measured* maker rebates** — a strong early signal for H2.
+- Behaviour separates the wallets: `0xb27b…` is a high-frequency market-maker (288
+  fills/market, 342k merges); `pspspsps5` is directional (0 merges). 100% of sampled
+  markets resolved.
 
 ## Install & run
 
