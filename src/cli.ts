@@ -13,7 +13,7 @@
  * Run: `node src/cli.ts <command> [options]`
  */
 import { mkdir, writeFile } from "node:fs/promises";
-import { getActivity, getTrades } from "./clients/data.ts";
+import { getActivity, getTrades, getClosedPositions, getPositions, getPortfolioValue } from "./clients/data.ts";
 import { getMarketSettlement } from "./clients/clob.ts";
 import { extractWalletFills, getTransactionReceipt } from "./clients/onchain.ts";
 import { getRequestCount as reqCount } from "./clients/http.ts";
@@ -22,9 +22,12 @@ import { resolveSubjects } from "./ingest/resolve-wallets.ts";
 import type { ResolvedSubject } from "./ingest/resolve-wallets.ts";
 import { openDb } from "./store/schema.ts";
 import { Repository } from "./store/repository.ts";
-import { ingestFills } from "./ingest/fetch-fills.ts";
-import { ingestActivity } from "./ingest/fetch-activity.ts";
+import { ingestFills, topUpFills } from "./ingest/fetch-fills.ts";
+import { ingestActivity, topUpActivity } from "./ingest/fetch-activity.ts";
+import { rebuildFills } from "./ingest/rebuild-fills.ts";
 import { collectVolume, formatVolume, sampleSettlement } from "./ingest/report.ts";
+import { backfillMarkets, backfillPlan } from "./ingest/fetch-markets.ts";
+import { buildDerived, walletSummaries, formatSummaries, exportArtifacts } from "./analysis/pnl.ts";
 
 const OUT_DIR = "output/phase0";
 const DEFAULT_WALLET = "0xfcdc071df7080c214196bb0b3b751e5417f9d8e3"; // neversmiling (resolved)
@@ -40,6 +43,9 @@ interface Args {
   sample: number;
   fillsOnly: boolean;
   activityOnly: boolean;
+  concurrency: number;
+  market?: string;
+  samples: number;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -52,6 +58,8 @@ function parseArgs(argv: string[]): Args {
     sample: 150,
     fillsOnly: false,
     activityOnly: false,
+    concurrency: 4,
+    samples: 50,
   };
   for (let i = 1; i < argv.length; i++) {
     const t = argv[i];
@@ -64,6 +72,9 @@ function parseArgs(argv: string[]): Args {
     else if (t === "--sample") a.sample = Number(argv[++i]) || 0;
     else if (t === "--fills-only") a.fillsOnly = true;
     else if (t === "--activity-only") a.activityOnly = true;
+    else if (t === "--concurrency") a.concurrency = Number(argv[++i]) || a.concurrency;
+    else if (t === "--market") a.market = argv[++i];
+    else if (t === "--samples") a.samples = Number(argv[++i]) || a.samples;
   }
   return a;
 }
@@ -309,9 +320,26 @@ async function cmdIngest(args: Args): Promise<void> {
     return;
   }
 
+  const topup = process.argv.includes("--topup");
   for (const w of wallets) {
     const addr = w.address as string;
     stamp(`▶ ${w.label} ${addr}`);
+    if (topup) {
+      // Top-up order is load-bearing: ACTIVITY FIRST, then fills (see
+      // fetch-activity.topUpActivity docstring). stopAt = previous coverage
+      // edge minus 5 min of overlap; dedup handles the overlap.
+      const edge = (table: string) =>
+        Number((db.prepare(`SELECT COALESCE(MAX(ts), 0) m FROM ${table} WHERE wallet = ?`).get(addr) as { m: number }).m);
+      if (!args.fillsOnly) {
+        const r = await topUpActivity(repo, addr, Math.max(0, edge("activity") - 300), { delayMs: args.delayMs, log: stamp });
+        stamp(`  activity top-up: +${r.rows} rows / ${r.pages} pages`);
+      }
+      if (!args.activityOnly) {
+        const r = await topUpFills(repo, addr, Math.max(0, edge("fills") - 300), { delayMs: args.delayMs, log: stamp });
+        stamp(`  fills top-up: +${r.rows} rows / ${r.pages} pages`);
+      }
+      continue;
+    }
     if (!args.activityOnly) {
       const r = await ingestFills(repo, addr, { maxPages: args.maxPages, delayMs: args.delayMs, log: stamp });
       stamp(`  fills: ${r.rows} rows / ${r.pages} pages / done=${r.done}`);
@@ -333,6 +361,306 @@ async function cmdIngest(args: Args): Promise<void> {
   }
   console.log("\n" + formatVolume(vols));
   console.log(`\nRequests this run: ${reqCount()}`);
+  db.close();
+}
+
+// ---------------------------------------------------------------------------
+// backfill-markets (Phase 2) — metadata + settlement for every conditionId
+// ---------------------------------------------------------------------------
+async function cmdBackfillMarkets(args: Args): Promise<void> {
+  const db = openDb();
+  const repo = new Repository(db);
+
+  if (args.dryRun) {
+    const plan = backfillPlan(repo);
+    console.log("PHASE 2 — backfill-markets [dry-run]\n");
+    console.log(`  distinct conditionIds (fills ∪ activity): ${plan.ids}`);
+    console.log(`  gamma batches of 40: ${plan.batches} (${plan.cachedBatches} already cached → replay offline)`);
+    console.log(`  gamma requests to make: ${plan.toFetch}`);
+    console.log(`  + CLOB fallback for whatever gamma misses (count known only after the gamma pass)`);
+    console.log(`  concurrency ${args.concurrency}, delay ${args.delayMs} ms. No calls made.`);
+    db.close();
+    return;
+  }
+
+  stamp(`▶ backfill-markets: metadata for all traded markets`);
+  const res = await backfillMarkets(repo, {
+    concurrency: args.concurrency,
+    delayMs: args.delayMs,
+    log: stamp,
+  });
+  hr();
+  console.log(`ids=${res.ids}  gammaRows=${res.gammaRows} (replayed ${res.replayedBatches}/${res.batches} batches)`);
+  console.log(`clobRows=${res.clobRows}  stillMissing=${res.stillMissing}  resolved=${res.resolved}  fiftyFifty=${res.fiftyFifty}`);
+  console.log(`winner cross-check vs stored rows: ${res.disagreements.length} disagreement(s)`);
+  for (const d of res.disagreements.slice(0, 20)) {
+    console.log(`  DISAGREE ${d.conditionId}: stored=${d.stored} fetched=${d.fetched}`);
+  }
+  if (res.disagreements.length > 0) {
+    console.log(`\n⚠ GATE: winner disagreements found — investigate before trusting metadata (spec §8).`);
+  }
+  console.log(`\nRequests made: ${reqCount()}`);
+  db.close();
+}
+
+// ---------------------------------------------------------------------------
+// rebuild-fills (Phase 2, offline) — replay raw cache into the seq-keyed table
+// ---------------------------------------------------------------------------
+async function cmdRebuildFills(args: Args): Promise<void> {
+  const db = openDb();
+  if (args.dryRun) {
+    console.log("[dry-run] rebuild-fills replays data/raw/fills/**.ndjson.gz into a fresh table");
+    console.log("          with the seq-augmented PK, then swaps it in. Fully offline.");
+    db.close();
+    return;
+  }
+  console.log("PHASE 2 — rebuild fills from raw cache (seq-augmented PK)\n");
+  const res = rebuildFills(db, stamp);
+  hr();
+  for (const p of res.perWallet) {
+    const gained = p.stored - p.before;
+    console.log(`  ${p.wallet.slice(0, 10)}… files=${p.files} raw=${p.rawRows} stored=${p.stored} (was ${p.before}, ${gained >= 0 ? "+" : ""}${gained} recovered)`);
+  }
+  console.log(`\nTOTAL stored: ${res.storedRows} (from ${res.rawRows} raw rows across ${res.files} files)`);
+  db.close();
+}
+
+// ---------------------------------------------------------------------------
+// pnl (Phase 2) — build derived tables + print per-wallet summaries (offline)
+// ---------------------------------------------------------------------------
+async function cmdPnl(args: Args): Promise<void> {
+  const db = openDb();
+  if (args.dryRun) {
+    console.log("[dry-run] pnl would rebuild positions/settlements/market_pnl from the local store");
+    console.log("          and print per-wallet summaries. Fully offline — no API calls ever.");
+    db.close();
+    return;
+  }
+  console.log("PHASE 2 — PnL engine (offline; cash-ledger accounting)\n");
+  const skipBuild = process.argv.includes("--skip-build");
+  if (skipBuild) {
+    stamp("(--skip-build: reusing existing derived tables)");
+  } else {
+    const stats = buildDerived(db, stamp);
+    stamp(`derived tables built in ${stats.seconds.toFixed(1)}s`);
+  }
+  hr();
+  const sums = walletSummaries(db);
+  const wallets = await usableWallets();
+  const labels = new Map(wallets.map((w) => [w.address as string, w.label]));
+  console.log(formatSummaries(sums, labels));
+  for (const p of exportArtifacts(db, sums, labels)) console.log(`  ↳ wrote ${p}`);
+  const worstClosure = Math.max(...sums.map((s) => Math.abs(s.ledgerClosureError)));
+  if (worstClosure > 1) {
+    console.log(`⚠ GATE: ledger closure error exceeds $1 (${worstClosure}) — the derived tables do NOT`);
+    console.log(`  reproduce the base-table cash identity; investigate before using these numbers.`);
+  }
+  db.close();
+}
+
+// ---------------------------------------------------------------------------
+// validate (Phase 2) — reconcile our per-market cash PnL against Polymarket's
+// own realizedPnl (/closed-positions), plus wallet-level context numbers.
+// Polymarket's figures are a CROSS-CHECK, never our source (spec).
+// ---------------------------------------------------------------------------
+interface MarketDelta {
+  wallet: string;
+  conditionId: string;
+  ours: number;
+  oursWithResid: number;
+  theirs: number | null;
+  delta: number | null;
+  rows: number;
+  note: string;
+}
+
+async function cmdValidate(args: Args): Promise<void> {
+  const db = openDb();
+  const wallets = await usableWallets(args.wallet);
+
+  if (args.dryRun) {
+    console.log(`[dry-run] validate would sample ~${args.samples} resolved markets per wallet`);
+    console.log("          (top by |cashPnl| + evenly-spaced) and fetch /closed-positions per market,");
+    console.log("          plus 1× /value and 1× /positions page per wallet. No calls made.");
+    db.close();
+    return;
+  }
+
+  console.log("PHASE 2 — validate: our cash PnL vs Polymarket's own realizedPnl\n");
+  const labelOf = new Map(wallets.map((w) => [w.address as string, w.label]));
+  const perMarket: MarketDelta[] = [];
+  const walletLevel: Array<Record<string, unknown>> = [];
+
+  for (const w of wallets) {
+    const addr = w.address as string;
+    // Sample: top-N/2 by |cashPnl| (stress the extremes) + N/2 evenly spaced
+    // over the resolved population (unbiased-ish, deterministic).
+    const half = Math.max(2, Math.floor(args.samples / 2));
+    const top = db
+      .prepare(
+        `SELECT conditionId, cashPnl, COALESCE(residValue, 0) rv FROM market_pnl
+         WHERE wallet = ? AND status = 'resolved' AND fillCount > 0
+         ORDER BY ABS(cashPnl) DESC LIMIT ?`,
+      )
+      .all(addr, half) as Array<{ conditionId: string; cashPnl: number; rv: number }>;
+    const total = (
+      db.prepare(`SELECT COUNT(*) c FROM market_pnl WHERE wallet = ? AND status = 'resolved' AND fillCount > 0`).get(addr) as {
+        c: number;
+      }
+    ).c;
+    const step = Math.max(1, Math.floor(total / half));
+    const spread = db
+      .prepare(
+        `SELECT conditionId, cashPnl, COALESCE(residValue, 0) rv FROM
+           (SELECT conditionId, cashPnl, residValue,
+                   ROW_NUMBER() OVER (ORDER BY conditionId) rn
+            FROM market_pnl WHERE wallet = ? AND status = 'resolved' AND fillCount > 0)
+         WHERE (rn - 1) % ? = 0 LIMIT ?`,
+      )
+      .all(addr, step, half) as Array<{ conditionId: string; cashPnl: number; rv: number }>;
+
+    const seen = new Set<string>();
+    const sample = [...top, ...spread].filter((s) =>
+      seen.has(s.conditionId) ? false : (seen.add(s.conditionId), true),
+    );
+
+    stamp(`▶ ${w.label}: reconciling ${sample.length} markets against /closed-positions…`);
+    for (const s of sample) {
+      const rows = await getClosedPositions({ user: addr, market: s.conditionId, limit: 10 });
+      const matching = rows.filter((r) => r.conditionId === s.conditionId);
+      if (rows.length > 0 && matching.length === 0) {
+        // market filter not honored — record and stop trusting this oracle
+        perMarket.push({
+          wallet: addr, conditionId: s.conditionId, ours: s.cashPnl, oursWithResid: s.cashPnl + s.rv,
+          theirs: null, delta: null, rows: rows.length, note: "market-filter-ignored",
+        });
+        continue;
+      }
+      const theirs = matching.reduce((acc, r) => acc + (r.realizedPnl ?? 0), 0);
+      const ours = s.cashPnl;
+      perMarket.push({
+        wallet: addr, conditionId: s.conditionId, ours, oursWithResid: ours + s.rv,
+        theirs, delta: ours - theirs, rows: matching.length,
+        note: matching.length === 0 ? "no-closed-position-rows" : "",
+      });
+      if (args.delayMs > 0) await new Promise((r) => setTimeout(r, args.delayMs));
+    }
+
+    // Wallet-level context (not a strict oracle): portfolio value + open positions.
+    const value = await getPortfolioValue(addr).catch(() => null);
+    const open = await getPositions({ user: addr, limit: 500, sizeThreshold: 1 }).catch(() => []);
+    const openValue = open.reduce((a, p) => a + (p.size ?? 0) * (p.curPrice ?? 0), 0);
+    const openRedeemable = open.filter((p) => p.redeemable).length;
+    walletLevel.push({
+      wallet: addr, label: w.label, portfolioValue: value,
+      openPositions: open.length, openRedeemable, openMarkValue: openValue,
+    });
+  }
+
+  hr();
+  console.log("Per-market reconciliation (ours − Polymarket realizedPnl):\n");
+  const byWallet = new Map<string, MarketDelta[]>();
+  for (const d of perMarket) {
+    if (!byWallet.has(d.wallet)) byWallet.set(d.wallet, []);
+    byWallet.get(d.wallet)!.push(d);
+  }
+  for (const [addr, ds] of byWallet) {
+    const ok = ds.filter((d) => d.delta !== null && d.rows > 0);
+    const missing = ds.filter((d) => d.rows === 0);
+    const deltas = ok.map((d) => Math.abs(d.delta as number)).sort((a, b) => a - b);
+    const deltasResid = ok.map((d) => Math.abs(d.oursWithResid - (d.theirs as number))).sort((a, b) => a - b);
+    const q = (arr: number[], p: number) => (arr.length ? arr[Math.min(arr.length - 1, Math.floor(p * arr.length))] : NaN);
+    const label = labelOf.get(addr) ?? addr.slice(0, 10);
+    console.log(`  ${label} — ${ok.length} compared, ${missing.length} without closed-position rows`);
+    console.log(`    |Δ cash|:        median $${q(deltas, 0.5).toFixed(4)}  p90 $${q(deltas, 0.9).toFixed(4)}  max $${q(deltas, 1).toFixed(2)}`);
+    console.log(`    |Δ cash+resid|:  median $${q(deltasResid, 0.5).toFixed(4)}  p90 $${q(deltasResid, 0.9).toFixed(4)}  max $${q(deltasResid, 1).toFixed(2)}`);
+    const worst = ok.sort((a, b) => Math.abs(b.delta as number) - Math.abs(a.delta as number)).slice(0, 3);
+    for (const d of worst) {
+      console.log(`    worst: ${d.conditionId.slice(0, 14)}… ours=${d.ours.toFixed(4)} theirs=${(d.theirs as number).toFixed(4)} Δ=${(d.delta as number).toFixed(4)}`);
+    }
+  }
+  console.log("\nWallet-level context:");
+  for (const wl of walletLevel) {
+    console.log(`  ${wl.label}: portfolioValue=$${Number(wl.portfolioValue ?? 0).toFixed(2)}  openPositions(size≥1)=${wl.openPositions} (redeemable: ${wl.openRedeemable}, mark $${Number(wl.openMarkValue).toFixed(2)})`);
+  }
+
+  await mkdir("output/phase2", { recursive: true });
+  await writeFile(
+    "output/phase2/validation.json",
+    JSON.stringify({ generatedAt: new Date().toISOString(), perMarket, walletLevel }, null, 2),
+  );
+  console.log(`\n  ↳ wrote output/phase2/validation.json`);
+  console.log(`Requests made: ${reqCount()}`);
+  db.close();
+}
+
+// ---------------------------------------------------------------------------
+// explain (Phase 2) — dump one (wallet × market) ledger for hand-checking
+// ---------------------------------------------------------------------------
+async function cmdExplain(args: Args): Promise<void> {
+  if (!args.market) {
+    console.log("usage: node src/cli.ts explain --market 0x… [--wallet 0x…]");
+    return;
+  }
+  const db = openDb();
+  const wallet = args.wallet ?? DEFAULT_WALLET;
+  const cid = args.market;
+
+  const meta = db.prepare(`SELECT * FROM markets WHERE conditionId = ?`).get(cid) as
+    | Record<string, unknown>
+    | undefined;
+  console.log(`━━ market ${cid}`);
+  if (meta) {
+    console.log(`   "${meta.question}"  slug=${meta.slug}`);
+    console.log(`   closed=${meta.closed} resolved=${meta.resolved} winner=${meta.winningOutcomeIndex} prices=${meta.outcomePrices} source=${meta.source} closedTime=${meta.closedTime}`);
+  } else {
+    console.log("   (no metadata row)");
+  }
+
+  const fills = db
+    .prepare(`SELECT side, size, price, ts, outcomeIndex, asset FROM fills WHERE wallet = ? AND conditionId = ? ORDER BY ts`)
+    .all(wallet, cid) as Array<{ side: string; size: number; price: number; ts: number; outcomeIndex: number | null; asset: string }>;
+  const tokenOi = new Map(
+    (db.prepare(`SELECT tokenId, outcomeIndex FROM tokens WHERE conditionId = ?`).all(cid) as Array<{ tokenId: string; outcomeIndex: number }>).map(
+      (t) => [t.tokenId, t.outcomeIndex],
+    ),
+  );
+  console.log(`\n━━ fills (${fills.length}) for wallet ${wallet}`);
+  const fmtTs = (ts: number) => new Date(ts * 1000).toISOString().slice(5, 19).replace("T", " ");
+  const show = fills.length <= 40 ? fills : [...fills.slice(0, 20), null, ...fills.slice(-20)];
+  for (const f of show) {
+    if (f === null) {
+      console.log(`   … ${fills.length - 40} more …`);
+      continue;
+    }
+    const oi = tokenOi.get(f.asset) ?? f.outcomeIndex;
+    console.log(`   ${fmtTs(f.ts)}  ${f.side.padEnd(4)} oi=${oi} ${String(f.size).padStart(12)} @ ${f.price}  = $${(f.size * f.price).toFixed(4)}`);
+  }
+  const acts = db
+    .prepare(`SELECT type, ts, usdcSize, size, outcomeIndex FROM activity WHERE wallet = ? AND conditionId = ? ORDER BY ts`)
+    .all(wallet, cid) as Array<{ type: string; ts: number; usdcSize: number; size: number | null; outcomeIndex: number | null }>;
+  console.log(`\n━━ activity (${acts.length})`);
+  for (const a of acts) {
+    console.log(`   ${fmtTs(a.ts)}  ${a.type.padEnd(7)} oi=${a.outcomeIndex}  usdc=$${a.usdcSize}  size=${a.size}`);
+  }
+
+  const pnl = db.prepare(`SELECT * FROM market_pnl WHERE wallet = ? AND conditionId = ?`).get(wallet, cid) as
+    | Record<string, unknown>
+    | undefined;
+  console.log(`\n━━ computed market_pnl row`);
+  if (!pnl) {
+    console.log("   (none — run `pnl` first)");
+  } else {
+    const n = (k: string) => Number(pnl[k] ?? 0);
+    console.log(`   status=${pnl.status}  winner=${pnl.winnerIdx} (source=${pnl.winnerSource}, agree=${pnl.winnerAgree})`);
+    console.log(`   buys:   qty0=${n("buyQty0").toFixed(4)} qty1=${n("buyQty1").toFixed(4)}  cost=$${n("buyCost").toFixed(4)}`);
+    console.log(`   sells:  qty=${n("sellQty").toFixed(4)}  proceeds=$${n("sellProceeds").toFixed(4)}`);
+    console.log(`   merge:  qty=${n("mergeQty").toFixed(4)}  cash=$${n("mergeCash").toFixed(4)}`);
+    console.log(`   redeem: qty=${n("redeemQty").toFixed(4)}  cash=$${n("redeemCash").toFixed(4)}`);
+    console.log(`   residual shares: oi0=${pnl.resid0 === null ? "·" : n("resid0").toFixed(4)}  oi1=${pnl.resid1 === null ? "·" : n("resid1").toFixed(4)}  value=$${pnl.residValue === null ? "·" : n("residValue").toFixed(4)}`);
+    console.log(`   paired=${n("pairedQty").toFixed(4)}  directional=${n("directionalQty").toFixed(4)}`);
+    console.log(`   ➜ cashPnl = redeem + merge + sells − buys = $${n("cashPnl").toFixed(4)}`);
+  }
   db.close();
 }
 
@@ -363,6 +691,12 @@ Usage:
   node src/cli.ts ingest  [--wallet 0x..] [--max-pages N] [--delay MS]
                           [--fills-only|--activity-only] [--sample N] [--dry-run]
   node src/cli.ts volume  [--wallet 0x..] [--sample N]   # report from store (--sample 0 = offline)
+  node src/cli.ts ingest --topup [--wallet 0x..]        # extend completed streams to now (activity first)
+  node src/cli.ts rebuild-fills [--dry-run]              # offline replay of raw cache (seq-keyed PK)
+  node src/cli.ts backfill-markets [--concurrency N] [--delay MS] [--dry-run]
+  node src/cli.ts pnl     [--dry-run]                    # build derived tables + summaries (offline)
+  node src/cli.ts validate [--wallet 0x..] [--samples N] [--delay MS]
+  node src/cli.ts explain --market 0x.. [--wallet 0x..]  # one-market ledger dump (offline)
 
 Environment:
   POLYGON_RPC_URL   optional read-only Polygon RPC (provider key = reliable backfill)
@@ -380,6 +714,21 @@ async function main(): Promise<void> {
       break;
     case "ingest":
       await cmdIngest(args);
+      break;
+    case "backfill-markets":
+      await cmdBackfillMarkets(args);
+      break;
+    case "rebuild-fills":
+      await cmdRebuildFills(args);
+      break;
+    case "pnl":
+      await cmdPnl(args);
+      break;
+    case "validate":
+      await cmdValidate(args);
+      break;
+    case "explain":
+      await cmdExplain(args);
       break;
     case "volume":
       await cmdVolume(args);

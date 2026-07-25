@@ -22,6 +22,13 @@ export function openDb(path: string = DB_PATH): Db {
   db.exec("PRAGMA journal_mode = WAL;");
   db.exec("PRAGMA synchronous = NORMAL;");
   db.exec(`
+    -- seq disambiguates LEGITIMATE duplicate fills: one tx can contain several
+    -- fills with identical (asset, side, size, price, ts) — e.g. one taker order
+    -- crossing two same-size maker quotes. seq = occurrence index of the
+    -- identical tuple within one API page, so INSERT OR IGNORE still dedups
+    -- window-overlap refetches while preserving true multiplicity. (Phase 2
+    -- finding: the original PK without seq silently dropped ~226 rows in a
+    -- single busy 5-minute market.)
     CREATE TABLE IF NOT EXISTS fills (
       wallet       TEXT    NOT NULL,
       tx           TEXT    NOT NULL,
@@ -32,7 +39,8 @@ export function openDb(path: string = DB_PATH): Db {
       price        REAL    NOT NULL,
       ts           INTEGER NOT NULL,
       outcomeIndex INTEGER,
-      PRIMARY KEY (wallet, tx, asset, side, size, price, ts)
+      seq          INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (wallet, tx, asset, side, size, price, ts, seq)
     );
     CREATE INDEX IF NOT EXISTS idx_fills_wallet_ts ON fills (wallet, ts);
     CREATE INDEX IF NOT EXISTS idx_fills_cond      ON fills (conditionId);
@@ -60,6 +68,19 @@ export function openDb(path: string = DB_PATH): Db {
       fetchedAt           TEXT
     );
 
+    -- Outcome-token map: fills.asset -> (conditionId, outcomeIndex). This is the
+    -- robust outcome join (fills.outcomeIndex can be the 999 enrichment-lag
+    -- placeholder). settlementPrice is the terminal $ value of one share (1/0,
+    -- or 0.5 on a 50/50 refund), NULL while the market is unresolved.
+    CREATE TABLE IF NOT EXISTS tokens (
+      tokenId         TEXT PRIMARY KEY,
+      conditionId     TEXT NOT NULL,
+      outcomeIndex    INTEGER NOT NULL,
+      outcome         TEXT,
+      settlementPrice REAL
+    );
+    CREATE INDEX IF NOT EXISTS idx_tokens_cond ON tokens (conditionId);
+
     -- Resume state: one row per (dataset:wallet) ingest stream.
     CREATE TABLE IF NOT EXISTS checkpoints (
       key       TEXT PRIMARY KEY,
@@ -70,5 +91,30 @@ export function openDb(path: string = DB_PATH): Db {
       updatedAt TEXT
     );
   `);
+  migrateMarketsColumns(db);
   return db;
+}
+
+/**
+ * Additive column migration for `markets` (Phase 2 metadata backfill). SQLite has
+ * no ADD COLUMN IF NOT EXISTS, so check PRAGMA table_info. Existing Phase-1 rows
+ * (CLOB-sourced settlement sample) are preserved — they serve as a cross-check
+ * set against the Gamma backfill before being overwritten.
+ */
+function migrateMarketsColumns(db: DatabaseSync): void {
+  const have = new Set(
+    (db.prepare(`PRAGMA table_info(markets)`).all() as Array<{ name: string }>).map((r) => r.name),
+  );
+  const want: Array<[string, string]> = [
+    ["slug", "TEXT"],
+    ["closedTime", "TEXT"], // e.g. "2026-03-30 20:05:33+00" (Gamma)
+    ["endDate", "TEXT"],
+    ["negRisk", "INTEGER"],
+    ["umaStatus", "TEXT"],
+    ["outcomePrices", "TEXT"], // raw JSON-encoded array, e.g. '["1", "0"]'
+    ["source", "TEXT"], // 'gamma' | 'clob'
+  ];
+  for (const [col, type] of want) {
+    if (!have.has(col)) db.exec(`ALTER TABLE markets ADD COLUMN ${col} ${type}`);
+  }
 }

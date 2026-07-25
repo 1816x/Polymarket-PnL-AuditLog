@@ -92,3 +92,32 @@ export async function endCursorIngest(opts: PaginateOptions): Promise<PaginateRe
   opts.log(`  ${key}: paused after ${pagesThisRun} pages (maxPages). resume to continue. ${rows} rows so far`);
   return { pages, rows, done: false };
 }
+
+/**
+ * Top-up: fetch NEW rows from "now" backward until reaching `stopAtTs` (the
+ * store's previous coverage edge, minus an overlap margin). Used to extend a
+ * completed stream to a fresh snapshot instant. No checkpointing — runs are
+ * small and fully idempotent (raw pages are append-only; inserts dedup), so an
+ * interrupted top-up is simply re-run.
+ */
+export async function topUpIngest(
+  opts: Omit<PaginateOptions, "maxPages"> & { stopAtTs: number },
+): Promise<PaginateResult> {
+  const key = `${opts.dataset}:${opts.wallet} (top-up)`;
+  let cursor: number | undefined = undefined;
+  let pages = 0;
+  let rows = 0;
+  for (;;) {
+    const batch = await opts.fetchPage(cursor, opts.pageLimit);
+    if (batch.length === 0) break;
+    writeRawPage(opts.dataset, opts.wallet, batch);
+    rows += opts.insert(opts.wallet, batch);
+    pages++;
+    const minTs = Math.min(...batch.map((r) => r.timestamp));
+    if (minTs <= opts.stopAtTs || batch.length < opts.pageLimit) break;
+    cursor = minTs === cursor ? minTs - 1 : minTs; // same stall guard as the main walk
+    if (opts.delayMs) await sleep(opts.delayMs);
+  }
+  opts.log(`  ${key}: +${rows} new rows in ${pages} pages (down to stopAt=${opts.stopAtTs})`);
+  return { pages, rows, done: true };
+}

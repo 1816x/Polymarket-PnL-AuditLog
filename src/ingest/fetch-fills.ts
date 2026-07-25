@@ -5,7 +5,7 @@
 import { getTrades } from "../clients/data.ts";
 import type { Trade } from "../clients/data.ts";
 import type { Repository } from "../store/repository.ts";
-import { endCursorIngest } from "./paginate.ts";
+import { endCursorIngest, topUpIngest } from "./paginate.ts";
 import type { PaginateResult } from "./paginate.ts";
 
 const PAGE_LIMIT = 10_000; // Data API clamps /trades at 10k
@@ -22,6 +22,26 @@ export function ingestFills(
     pageLimit: PAGE_LIMIT,
     maxPages: opts.maxPages,
     delayMs: opts.delayMs,
+    fetchPage: (end, limit) => getTrades({ user: wallet, takerOnly: false, end, limit }),
+    insert: (w, rows) => repo.insertFills(w, rows as Trade[]),
+    log: opts.log,
+  });
+}
+
+/** Extend a completed fills stream to now (see paginate.topUpIngest). */
+export function topUpFills(
+  repo: Repository,
+  wallet: string,
+  stopAtTs: number,
+  opts: { delayMs: number; log: (m: string) => void },
+): Promise<PaginateResult> {
+  return topUpIngest({
+    dataset: "fills",
+    wallet,
+    repo,
+    pageLimit: PAGE_LIMIT,
+    delayMs: opts.delayMs,
+    stopAtTs,
     fetchPage: (end, limit) => getTrades({ user: wallet, takerOnly: false, end, limit }),
     insert: (w, rows) => repo.insertFills(w, rows as Trade[]),
     log: opts.log,

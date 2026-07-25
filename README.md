@@ -64,19 +64,29 @@ step, no `tsx`).
 ```bash
 npm install
 
-# Resolve the 5 subject wallets (usernames -> proxy addresses)
-node src/cli.ts resolve
-node src/cli.ts resolve --dry-run     # show the request plan without calling
+# Phase 0 — resolve subjects + recon raw data shapes
+node src/cli.ts resolve                                   # usernames -> proxy addresses
+node src/cli.ts recon --wallet 0xce25…7fdc --limit 8      # raw fills/activity/settlement/on-chain
 
-# Recon one wallet: raw fills, activity, settlement, on-chain maker/taker for one tx
-node src/cli.ts recon                                     # defaults to neversmiling
-node src/cli.ts recon --wallet 0xce25…7fdc --limit 8
-node src/cli.ts recon --dry-run
+# Phase 1 — full resumable ingest (fills + non-trade activity, append-only raw cache)
+node src/cli.ts ingest --dry-run                          # show resume state / plan
+node src/cli.ts ingest                                    # idempotent; resumes after interruption
+node src/cli.ts ingest --topup                            # extend completed streams to now
+node src/cli.ts volume --sample 0                         # volume report from the store (offline)
 
+# Phase 2 — market metadata, PnL engine, validation
+node src/cli.ts backfill-markets                          # settlement + token map for every market
+node src/cli.ts rebuild-fills                             # offline raw-cache replay (seq-keyed PK)
+node src/cli.ts pnl                                       # build positions/settlements/market_pnl + summaries (offline)
+node src/cli.ts validate --samples 50                     # reconcile vs Polymarket's own realizedPnl
+node src/cli.ts explain --market 0x… --wallet 0x…         # one-market ledger dump for hand-checking
+
+npm test                              # fixture tests (node --test, in-memory DB)
 npm run typecheck                     # tsc --noEmit
 ```
 
-Raw dumps land in `output/phase0/` (gitignored — regenerable).
+Every command supports `--dry-run` (prints the request plan without calling). All analysis
+commands are fully offline. Generated dumps land in `output/` (gitignored — regenerable).
 
 ## Architecture
 
@@ -90,13 +100,35 @@ src/
                         the V2 cutover, subject wallets
   clients/              thin, zod-validated wrappers (no business logic):
     http.ts             fetch + JSON-RPC, retry/backoff+jitter, request counter
-    gamma.ts            profile resolution (username -> proxy wallet)
-    data.ts             /trades (fills) + /activity (cash flows)
-    clob.ts             /markets/<conditionId> — reliable settlement (winner)
+    gamma.ts            profile resolution + batched market metadata (closed=true!)
+    data.ts             /trades, /activity, /closed-positions, /positions, /value
+    clob.ts             /markets/<conditionId> — per-id settlement fallback
     onchain.ts          Polygon OrderFilled decode — maker/taker + fee oracle
-  ingest/resolve-wallets.ts   exact-match resolution w/ round-trip verification
-  cli.ts                resolve | recon (Phase 0)
+  ingest/
+    resolve-wallets.ts  exact-match resolution w/ round-trip verification
+    paginate.ts         end-cursor time pagination + top-up; never offset paging
+    cache.ts            append-only gzipped raw page cache (source of truth)
+    fetch-fills.ts / fetch-activity.ts / fetch-markets.ts / rebuild-fills.ts
+  store/
+    schema.ts           SQLite DDL (node:sqlite; fills PK carries seq — see below)
+    repository.ts       typed reads/writes, idempotent inserts, checkpoints
+  analysis/
+    pnl.ts              Phase 2 engine: positions/settlements/market_pnl + summaries
+  cli.ts                resolve | recon | ingest | backfill-markets | rebuild-fills |
+                        pnl | validate | explain | volume
+tests/pnl.test.ts       fixture ledgers with known PnL (node --test, in-memory DB)
 ```
 
-Phases 1–5 (ingest → PnL engine → analysis → report → optional control group) build on this
-foundation; see the plan and the Phase 0 report.
+**Accounting model (Phase 2):** per (wallet × market), realized **cash-ledger** PnL =
+`Σ REDEEM.usdcSize + Σ MERGE.usdcSize + sells − buys`; unredeemed shares are valued at
+settlement price; rebates are wallet-level (their rows carry no market) and always reported
+as a separate line; no estimated quantity ever mixes into a measured column (spec §8).
+
+**Hard-won data lessons** (each cost real debugging, all covered by tests): Gamma's
+`/markets` hides closed markets unless `closed=true` is passed; `/trades` can contain
+LEGITIMATE duplicate rows (one taker order crossing several same-size quotes in one tx) so
+the fills PK carries an occurrence counter `seq`; top-ups must fetch activity BEFORE fills
+or settlement cash appears without its fills (phantom inflows).
+
+Phases 3–5 (fees/maker-taker/stats → report → optional control group) build on this; see
+`docs/phase*-report.md` for the per-phase checkpoints.

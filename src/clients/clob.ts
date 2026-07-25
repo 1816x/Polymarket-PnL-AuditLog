@@ -34,6 +34,8 @@ export type ClobMarket = z.infer<typeof ClobMarketSchema>;
 export interface Settlement {
   conditionId: string;
   resolved: boolean;
+  /** Raw `closed` flag from the market object (needed to tell a 50/50 refund from an open market). */
+  closed: boolean | null;
   /** outcome index (0/1) that won, or null if unresolved/ambiguous. */
   winningOutcomeIndex: number | null;
   winningTokenId: string | null;
@@ -56,6 +58,7 @@ export async function getMarketSettlement(conditionId: string): Promise<Settleme
   return {
     conditionId,
     resolved,
+    closed: market.closed ?? null,
     winningOutcomeIndex: resolved ? winnerIdx : null,
     winningTokenId: resolved ? tokens[winnerIdx].token_id : null,
     question: market.question ?? null,

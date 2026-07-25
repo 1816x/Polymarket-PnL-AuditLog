@@ -1,10 +1,13 @@
 /**
- * Gamma API client — profile resolution.
+ * Gamma API client — profile resolution + batched market metadata.
  *
- * Used for username -> proxy-wallet resolution. NOTE (Phase 0 finding): Gamma's
- * /markets lookup by condition_ids is unreliable for freshly-resolved short-term
- * markets (returns [] intermittently), so settlement is read from the CLOB client
- * instead; Gamma here is scoped to profiles.
+ * Phase 0 found /markets?condition_ids= "unreliable" for resolved short-term
+ * markets. Phase 2 identified the real cause: the endpoint EXCLUDES closed
+ * markets unless `closed=true` is passed — a resolved market silently vanishes
+ * from the default listing. With closed=true, batches of 40 ids return 40/40
+ * (verified live 2026-07-25, incl. 40/40 winner agreement vs CLOB-sourced rows).
+ * getClosedMarketsByConditionIds is therefore only valid for CLOSED markets;
+ * still-open ones fall through to the CLOB per-id client.
  */
 import { z } from "zod";
 import { GAMMA_API } from "../config/constants.ts";
@@ -42,6 +45,46 @@ const PublicProfileSchema = z.object({
   displayUsernamePublic: z.boolean().nullable().optional(),
 });
 export type PublicProfile = z.infer<typeof PublicProfileSchema>;
+
+// ---------------------------------------------------------------------------
+// Batched market metadata (Phase 2 backfill)
+// ---------------------------------------------------------------------------
+
+const GammaMarketSchema = z.object({
+  conditionId: z.string(),
+  question: z.string().nullable().optional(),
+  slug: z.string().nullable().optional(),
+  closed: z.boolean().nullable().optional(),
+  closedTime: z.string().nullable().optional(),
+  endDate: z.string().nullable().optional(),
+  negRisk: z.boolean().nullable().optional(),
+  umaResolutionStatus: z.string().nullable().optional(),
+  /** JSON-encoded string array of outcome names, e.g. '["Up", "Down"]'. */
+  outcomes: z.string().nullable().optional(),
+  /** JSON-encoded string array of terminal prices, e.g. '["1", "0"]'. */
+  outcomePrices: z.string().nullable().optional(),
+  /** JSON-encoded string array of ERC-1155 token ids, aligned with `outcomes`. */
+  clobTokenIds: z.string().nullable().optional(),
+});
+export type GammaMarket = z.infer<typeof GammaMarketSchema>;
+
+/**
+ * Fetch metadata for a batch of CLOSED markets by conditionId (max ~40 per call
+ * to stay well under URL-length limits). Returns whatever Gamma has — callers
+ * must treat missing ids as "not covered" and fall back to the CLOB client.
+ * `closed=true` is REQUIRED (see file header); open markets never appear here.
+ */
+export async function getClosedMarketsByConditionIds(ids: string[]): Promise<GammaMarket[]> {
+  if (ids.length === 0) return [];
+  const p = new URLSearchParams();
+  for (const id of ids) p.append("condition_ids", id);
+  p.set("closed", "true");
+  p.set("limit", String(Math.max(ids.length, 50)));
+  const raw = await getJson(`${GAMMA_API}/markets?${p.toString()}`, {
+    label: `gamma markets batch(${ids.length})`,
+  });
+  return z.array(GammaMarketSchema).parse(raw);
+}
 
 /**
  * Reverse lookup address -> profile. This direction is exact and authoritative;

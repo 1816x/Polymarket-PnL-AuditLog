@@ -77,6 +77,84 @@ export interface ActivityQuery {
   type?: string;
 }
 
+// ---------------------------------------------------------------------------
+// Polymarket's OWN per-position PnL (Phase 2 reconciliation oracle — never our
+// source of truth, spec §-recon). One row per outcome TOKEN; sum the ≤2 rows of
+// a conditionId to compare per-market.
+// ---------------------------------------------------------------------------
+
+const ClosedPositionSchema = z.object({
+  proxyWallet: z.string(),
+  asset: z.string(),
+  conditionId: z.string(),
+  avgPrice: z.number().nullable().optional(),
+  totalBought: z.number().nullable().optional(),
+  realizedPnl: z.number().nullable().optional(),
+  curPrice: z.number().nullable().optional(),
+  outcomeIndex: z.number().nullable().optional(),
+  title: z.string().nullable().optional(),
+});
+export type ClosedPosition = z.infer<typeof ClosedPositionSchema>;
+
+/** Polymarket's own realized PnL per closed position. `market` filters by conditionId. */
+export async function getClosedPositions(q: {
+  user: string;
+  market?: string;
+  limit?: number;
+  offset?: number;
+}): Promise<ClosedPosition[]> {
+  const p = new URLSearchParams({ user: q.user });
+  if (q.market) p.set("market", q.market);
+  p.set("limit", String(q.limit ?? 50));
+  if (q.offset) p.set("offset", String(q.offset));
+  const raw = await getJson(`${DATA_API}/closed-positions?${p.toString()}`, {
+    label: `data /closed-positions ${q.user}`,
+  });
+  return z.array(ClosedPositionSchema).parse(raw);
+}
+
+const OpenPositionSchema = z.object({
+  proxyWallet: z.string(),
+  asset: z.string(),
+  conditionId: z.string(),
+  size: z.number().nullable().optional(),
+  avgPrice: z.number().nullable().optional(),
+  cashPnl: z.number().nullable().optional(),
+  realizedPnl: z.number().nullable().optional(),
+  curPrice: z.number().nullable().optional(),
+  redeemable: z.boolean().nullable().optional(),
+  mergeable: z.boolean().nullable().optional(),
+  outcomeIndex: z.number().nullable().optional(),
+  title: z.string().nullable().optional(),
+});
+export type OpenPosition = z.infer<typeof OpenPositionSchema>;
+
+/** Current (open/redeemable) positions with Polymarket's own PnL fields. */
+export async function getPositions(q: {
+  user: string;
+  market?: string;
+  limit?: number;
+  sizeThreshold?: number;
+}): Promise<OpenPosition[]> {
+  const p = new URLSearchParams({ user: q.user });
+  if (q.market) p.set("market", q.market);
+  p.set("limit", String(q.limit ?? 50));
+  p.set("sizeThreshold", String(q.sizeThreshold ?? 0));
+  const raw = await getJson(`${DATA_API}/positions?${p.toString()}`, { label: `data /positions ${q.user}` });
+  return z.array(OpenPositionSchema).parse(raw);
+}
+
+/** Current portfolio (token holdings) value in USDC, per Polymarket. */
+export async function getPortfolioValue(user: string): Promise<number | null> {
+  const raw = await getJson(`${DATA_API}/value?user=${encodeURIComponent(user)}`, {
+    label: `data /value ${user}`,
+  });
+  const arr = z.array(z.object({ user: z.string().optional(), value: z.number() })).safeParse(raw);
+  if (arr.success && arr.data[0]) return arr.data[0].value;
+  const obj = z.object({ value: z.number() }).safeParse(raw);
+  return obj.success ? obj.data.value : null;
+}
+
 /** Fetch a page of activity rows for a wallet (limit capped at 500 by the API). */
 export async function getActivity(q: ActivityQuery): Promise<Activity[]> {
   const p = new URLSearchParams({ user: q.user });
