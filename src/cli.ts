@@ -524,24 +524,28 @@ async function cmdValidate(args: Args): Promise<void> {
       seen.has(s.conditionId) ? false : (seen.add(s.conditionId), true),
     );
 
-    stamp(`▶ ${w.label}: reconciling ${sample.length} markets against /closed-positions…`);
+    stamp(`▶ ${w.label}: reconciling ${sample.length} markets against /closed-positions + /positions…`);
     for (const s of sample) {
-      const rows = await getClosedPositions({ user: addr, market: s.conditionId, limit: 10 });
-      const matching = rows.filter((r) => r.conditionId === s.conditionId);
-      if (rows.length > 0 && matching.length === 0) {
-        // market filter not honored — record and stop trusting this oracle
-        perMarket.push({
-          wallet: addr, conditionId: s.conditionId, ours: s.cashPnl, oursWithResid: s.cashPnl + s.rv,
-          theirs: null, delta: null, rows: rows.length, note: "market-filter-ignored",
-        });
-        continue;
-      }
-      const theirs = matching.reduce((acc, r) => acc + (r.realizedPnl ?? 0), 0);
-      const ours = s.cashPnl;
+      // Polymarket splits one market across BOTH endpoints: legs closed by
+      // merge/redeem/sell sit in /closed-positions (realizedPnl), while any
+      // leftover shares sit in /positions carrying that leg's realizedPnl plus
+      // the mark on the remainder (cashPnl; at settlement price once
+      // resolved). Their full per-market figure is the sum of all of it —
+      // comparable to our cashPnl + residValue.
+      const closed = (await getClosedPositions({ user: addr, market: s.conditionId, limit: 10 })).filter(
+        (r) => r.conditionId === s.conditionId,
+      );
+      const open = (await getPositions({ user: addr, market: s.conditionId, sizeThreshold: 0, limit: 10 })).filter(
+        (r) => r.conditionId === s.conditionId,
+      );
+      const theirs =
+        closed.reduce((acc, r) => acc + (r.realizedPnl ?? 0), 0) +
+        open.reduce((acc, r) => acc + (r.realizedPnl ?? 0) + (r.cashPnl ?? 0), 0);
+      const oursWithResid = s.cashPnl + s.rv;
       perMarket.push({
-        wallet: addr, conditionId: s.conditionId, ours, oursWithResid: ours + s.rv,
-        theirs, delta: ours - theirs, rows: matching.length,
-        note: matching.length === 0 ? "no-closed-position-rows" : "",
+        wallet: addr, conditionId: s.conditionId, ours: s.cashPnl, oursWithResid,
+        theirs, delta: oursWithResid - theirs, rows: closed.length + open.length,
+        note: closed.length + open.length === 0 ? "no-position-rows" : "",
       });
       if (args.delayMs > 0) await new Promise((r) => setTimeout(r, args.delayMs));
     }
@@ -568,15 +572,13 @@ async function cmdValidate(args: Args): Promise<void> {
     const ok = ds.filter((d) => d.delta !== null && d.rows > 0);
     const missing = ds.filter((d) => d.rows === 0);
     const deltas = ok.map((d) => Math.abs(d.delta as number)).sort((a, b) => a - b);
-    const deltasResid = ok.map((d) => Math.abs(d.oursWithResid - (d.theirs as number))).sort((a, b) => a - b);
     const q = (arr: number[], p: number) => (arr.length ? arr[Math.min(arr.length - 1, Math.floor(p * arr.length))] : NaN);
     const label = labelOf.get(addr) ?? addr.slice(0, 10);
-    console.log(`  ${label} — ${ok.length} compared, ${missing.length} without closed-position rows`);
-    console.log(`    |Δ cash|:        median $${q(deltas, 0.5).toFixed(4)}  p90 $${q(deltas, 0.9).toFixed(4)}  max $${q(deltas, 1).toFixed(2)}`);
-    console.log(`    |Δ cash+resid|:  median $${q(deltasResid, 0.5).toFixed(4)}  p90 $${q(deltasResid, 0.9).toFixed(4)}  max $${q(deltasResid, 1).toFixed(2)}`);
+    console.log(`  ${label} — ${ok.length} compared, ${missing.length} without any position rows`);
+    console.log(`    |Δ (ours cash+resid − theirs)|: median $${q(deltas, 0.5).toFixed(4)}  p90 $${q(deltas, 0.9).toFixed(4)}  max $${q(deltas, 1).toFixed(2)}`);
     const worst = ok.sort((a, b) => Math.abs(b.delta as number) - Math.abs(a.delta as number)).slice(0, 3);
     for (const d of worst) {
-      console.log(`    worst: ${d.conditionId.slice(0, 14)}… ours=${d.ours.toFixed(4)} theirs=${(d.theirs as number).toFixed(4)} Δ=${(d.delta as number).toFixed(4)}`);
+      console.log(`    worst: ${d.conditionId.slice(0, 14)}… ours=${d.oursWithResid.toFixed(4)} theirs=${(d.theirs as number).toFixed(4)} Δ=${(d.delta as number).toFixed(4)}`);
     }
   }
   console.log("\nWallet-level context:");

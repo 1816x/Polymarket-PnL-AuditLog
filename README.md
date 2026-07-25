@@ -30,12 +30,20 @@ not an advertisement — see the hard rigor rules in the spec (§8).
   read-only infrastructure, not a wallet key.
 - We are **not** building a bot and **not** trading.
 
-## Status: Phase 1 (Ingest) — complete
+## Status: Phase 2 (PnL engine) — complete
 
-Per the spec's phased workflow (§7), work stops for review after each phase.
-Reports: **[`docs/phase0-report.md`](docs/phase0-report.md)** (recon / go-no-go) and
-**[`docs/phase1-report.md`](docs/phase1-report.md)** (ingest / volume). **No PnL is
-computed yet** — that is Phase 2.
+Per the spec's phased workflow (§7), work stops for review after each phase. Reports:
+**[`docs/phase0-report.md`](docs/phase0-report.md)** (recon),
+**[`docs/phase1-report.md`](docs/phase1-report.md)** (ingest),
+**[`docs/phase2-report.md`](docs/phase2-report.md)** (PnL + validation).
+
+Phase 2 headline — **all four auditable wallets are profitable** on a validated
+cash-ledger basis (full life, through 2026-07-25): trading PnL **$1.56–1.71M** (range =
+the quantified pre-V2 trade-feed gap) plus **$589k of measured rebates** ≈
+**$2.15–2.29M total**. Our per-wallet figures reproduce Polymarket's own leaderboard
+profit to **±0.07–1.5%**, and per-market realized PnL matches their `/closed-positions`
++ `/positions` accounting to cents in the post-V2 era. Fees/maker-taker (H2) and the
+statistical layer are Phase 3.
 
 Phase 0 (reconnaissance) headline:
 
