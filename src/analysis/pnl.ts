@@ -41,45 +41,94 @@ export function buildDerived(db: Db, log: (m: string) => void = () => {}): Build
     Number((db.prepare(`SELECT COUNT(*) c FROM ${t}`).get() as { c: number }).c);
 
   // ---- positions: per (wallet, market, outcome) fill aggregates -----------
-  // Two steps: aggregate by asset first (no join against 19.9M rows), then map
-  // asset → outcomeIndex via the small tokens table. fillOi keeps fills' own
-  // 0/1 as a fallback for assets missing from tokens (e.g. unresolved backfill
-  // tail); 999 placeholders never pass the IN (0,1) filter.
-  log("building positions (aggregating fills)…");
+  // Streaming aggregation in JS over chunked rowid scans. A plain SQL GROUP BY
+  // over ~20M rows needs a multi-GB temp b-tree, which does not fit the disk
+  // headroom next to the (freelist-bloated) main DB file — whereas the final
+  // aggregate is only ~600k groups, and the new tables reuse the DB's own
+  // freelist pages. Outcome mapping per fill: tokens.outcomeIndex by asset
+  // (authoritative), else the fill's own 0/1 (999 placeholders excluded),
+  // else NULL.
+  log("building positions (streaming fills aggregation)…");
   db.exec(`
     DROP TABLE IF EXISTS pos_raw;
-    CREATE TABLE pos_raw AS
-    SELECT wallet, conditionId, asset,
-           SUM(CASE WHEN side = 'BUY'  THEN size ELSE 0 END)         buyQty,
-           SUM(CASE WHEN side = 'BUY'  THEN size * price ELSE 0 END) buyCost,
-           SUM(CASE WHEN side = 'SELL' THEN size ELSE 0 END)         sellQty,
-           SUM(CASE WHEN side = 'SELL' THEN size * price ELSE 0 END) sellProceeds,
-           COUNT(*) fillCount, MIN(ts) firstTs, MAX(ts) lastTs,
-           MAX(CASE WHEN outcomeIndex IN (0, 1) THEN outcomeIndex END) fillOi
-    FROM fills
-    GROUP BY 1, 2, 3;
-
     DROP TABLE IF EXISTS positions;
-    CREATE TABLE positions AS
-    SELECT p.wallet                          wallet,
-           p.conditionId                     conditionId,
-           COALESCE(t.outcomeIndex, p.fillOi) oi,
-           SUM(p.buyQty)       buyQty,
-           SUM(p.buyCost)      buyCost,
-           SUM(p.sellQty)      sellQty,
-           SUM(p.sellProceeds) sellProceeds,
-           SUM(p.fillCount)    fillCount,
-           MIN(p.firstTs)      firstTs,
-           MAX(p.lastTs)       lastTs
-    FROM pos_raw p
-    LEFT JOIN tokens t ON t.tokenId = p.asset
-    GROUP BY 1, 2, 3;
-
-    DROP TABLE pos_raw;
-    CREATE INDEX idx_positions_wc ON positions (wallet, conditionId);
+    CREATE TABLE positions (
+      wallet TEXT NOT NULL, conditionId TEXT NOT NULL, oi INTEGER,
+      buyQty REAL NOT NULL, buyCost REAL NOT NULL,
+      sellQty REAL NOT NULL, sellProceeds REAL NOT NULL,
+      fillCount INTEGER NOT NULL, firstTs INTEGER, lastTs INTEGER
+    );
   `);
+  const tokOi = new Map<string, number>();
+  for (const t of db.prepare(`SELECT tokenId, outcomeIndex FROM tokens`).all() as Array<{
+    tokenId: string;
+    outcomeIndex: number;
+  }>) {
+    tokOi.set(t.tokenId, t.outcomeIndex);
+  }
+  type Agg = [number, number, number, number, number, number, number]; // buyQty, buyCost, sellQty, sellProceeds, n, minTs, maxTs
+  const groups = new Map<string, Agg>();
+  const CHUNK = 250_000;
+  const chunkStmt = db.prepare(
+    `SELECT rowid rid, wallet, conditionId, asset, side, size, price, ts, outcomeIndex
+     FROM fills WHERE rowid > ? ORDER BY rowid LIMIT ${CHUNK}`,
+  );
+  let lastRid = -1;
+  let scanned = 0;
+  for (;;) {
+    const chunk = chunkStmt.all(lastRid) as Array<{
+      rid: number;
+      wallet: string;
+      conditionId: string;
+      asset: string;
+      side: string;
+      size: number;
+      price: number;
+      ts: number;
+      outcomeIndex: number | null;
+    }>;
+    if (chunk.length === 0) break;
+    for (const f of chunk) {
+      const oi = tokOi.get(f.asset) ?? (f.outcomeIndex === 0 || f.outcomeIndex === 1 ? f.outcomeIndex : null);
+      const key = `${f.wallet}|${f.conditionId}|${oi ?? "x"}`;
+      let g = groups.get(key);
+      if (!g) {
+        g = [0, 0, 0, 0, 0, f.ts, f.ts];
+        groups.set(key, g);
+      }
+      if (f.side === "BUY") {
+        g[0] += f.size;
+        g[1] += f.size * f.price;
+      } else {
+        g[2] += f.size;
+        g[3] += f.size * f.price;
+      }
+      g[4]++;
+      if (f.ts < g[5]) g[5] = f.ts;
+      if (f.ts > g[6]) g[6] = f.ts;
+    }
+    lastRid = chunk[chunk.length - 1].rid;
+    scanned += chunk.length;
+    if (scanned % 2_000_000 < CHUNK) log(`  …scanned ${scanned.toLocaleString("en-US")} fills, ${groups.size} groups`);
+  }
+  const insPos = db.prepare(`INSERT INTO positions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+  db.exec("BEGIN");
+  for (const [key, g] of groups) {
+    const sep1 = key.indexOf("|");
+    const sep2 = key.indexOf("|", sep1 + 1);
+    const oiStr = key.slice(sep2 + 1);
+    insPos.run(
+      key.slice(0, sep1),
+      key.slice(sep1 + 1, sep2),
+      oiStr === "x" ? null : Number(oiStr),
+      g[0], g[1], g[2], g[3], g[4], g[5], g[6],
+    );
+  }
+  db.exec("COMMIT");
+  groups.clear();
+  db.exec(`CREATE INDEX idx_positions_wc ON positions (wallet, conditionId);`);
   const nPos = count("positions");
-  log(`  positions: ${nPos} rows`);
+  log(`  positions: ${nPos} rows (from ${scanned.toLocaleString("en-US")} fills scanned)`);
 
   // ---- settlements: per (wallet, market) cash-out aggregates --------------
   log("building settlements (aggregating activity)…");
