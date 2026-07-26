@@ -30,20 +30,29 @@ not an advertisement — see the hard rigor rules in the spec (§8).
   read-only infrastructure, not a wallet key.
 - We are **not** building a bot and **not** trading.
 
-## Status: Phase 2 (PnL engine) — complete
+## Status: Phase 3 (analysis) — complete
 
 Per the spec's phased workflow (§7), work stops for review after each phase. Reports:
 **[`docs/phase0-report.md`](docs/phase0-report.md)** (recon),
 **[`docs/phase1-report.md`](docs/phase1-report.md)** (ingest),
-**[`docs/phase2-report.md`](docs/phase2-report.md)** (PnL + validation).
+**[`docs/phase2-report.md`](docs/phase2-report.md)** (PnL + validation),
+**[`docs/phase3-report.md`](docs/phase3-report.md)** (hypotheses).
 
 Phase 2 headline — **all four auditable wallets are profitable** on a validated
-cash-ledger basis (full life, through 2026-07-25): trading PnL **$1.56–1.71M** (range =
-the quantified pre-V2 trade-feed gap) plus **$589k of measured rebates** ≈
-**$2.15–2.29M total**. Our per-wallet figures reproduce Polymarket's own leaderboard
-profit to **±0.07–1.5%**, and per-market realized PnL matches their `/closed-positions`
-+ `/positions` accounting to cents in the post-V2 era. Fees/maker-taker (H2) and the
-statistical layer are Phase 3.
+cash-ledger basis (full life, through 2026-07-25): trading PnL **$1.7M** plus **$589k
+of measured rebates** ≈ **$2.29M total**, reproducing Polymarket's own per-market and
+leaderboard accounting to cents / ±0.07–1.5%.
+
+Phase 3 headline — the result is **statistically solid and mechanically explained**:
+every wallet's per-market mean PnL CI excludes zero; measured trading fees are **0**
+(so the cash figures are net); the four wallets split into two makers (89%/83% maker),
+a taker (82%), and a hybrid; the **paired leg earns everything (+$2.45M) while
+directional remainders lose (−$743k)**; only 60–65% of assembled pairs cost < $1 (the
+article's "avg < $1" hides the losing tail), and single-leg markets the article's
+metric can't see are up to 51% of a wallet's activity. Peak deployed capital:
+**$1.7k–$9.2k per wallet** — high-velocity recycling, not capital intensity. The pre-V2
+"phantom inflow" is closed: 80/80 sampled markets show V1-feed-omitted **mint-match
+legs** on-chain. Remaining: Phase 4 (final synthesis report + charts).
 
 Phase 0 (reconnaissance) headline:
 

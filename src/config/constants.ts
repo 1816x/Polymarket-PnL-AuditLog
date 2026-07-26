@@ -106,11 +106,18 @@ export const TOKEN_DECIMALS = 6;
 export const TOKEN_SCALE = 10 ** TOKEN_DECIMALS;
 
 // ---------------------------------------------------------------------------
-// Taker-fee schedule — fee = shares * rate * price * (1 - price), takers only.
-// Rate is TIME-VARYING; never hardcode a single value mid-logic (spec §3.3).
-// Dates below are from SECONDARY reporting (agent research) and MUST be pinned
-// to primary Polymarket announcements before the pre/post-fees cut is published.
-// Makers pay 0 (confirmed on-chain in Phase 0: maker leg fee == 0).
+// Taker-fee schedule — MEASURED, superseding the Phase-0 PROVISIONAL entries
+// (which came from secondary reporting and claimed 7.2%→7.0% during 2026).
+//
+// Phase-3 measurement (890 sampled receipts across both eras, 2026-07-26):
+// EFFECTIVE fee collected from these wallets = 0 in every sampled leg, both
+// eras. Post-V2 OrderFilled emits fee=0 outright. V1 OrderFilled emits a
+// nonzero fee WORD (~10% of the output amount, matching a fee-rate-bps order
+// allowance) that was demonstrably never settled: share conservation closes
+// to ~0 against the API amounts and the cash ledger reconciles with
+// Polymarket's own accounting to cents — a collected fee of that size would
+// break both. The separately-measured MAKER_REBATE/TAKER_REBATE income
+// (activity rows) is the fee-adjacent cash flow that actually exists.
 // ---------------------------------------------------------------------------
 export interface FeeRatePeriod {
   fromTs: number; // epoch seconds, inclusive
@@ -119,20 +126,10 @@ export interface FeeRatePeriod {
 }
 
 export const CRYPTO_FEE_SCHEDULE: FeeRatePeriod[] = [
-  { fromTs: 0, rate: 0, note: "no taker fee before intro" },
-  {
-    fromTs: Math.floor(Date.parse("2026-01-01T00:00:00Z") / 1000),
-    rate: 0.072,
-    note: "PROVISIONAL intro ~Jan 2026 (15m crypto first); pin exact date to primary source",
-  },
-  {
-    fromTs: Math.floor(Date.parse("2026-07-01T00:00:00Z") / 1000),
-    rate: 0.07,
-    note: "PROVISIONAL crypto rate eased 0.072->0.07 ~Jul 2026; pin exact date",
-  },
+  { fromTs: 0, rate: 0, note: "measured 0 across the Phase-3 receipt sample (both eras); see docs/phase3-report.md" },
 ];
 
-/** Crypto taker-fee rate in effect at a timestamp (0 before fees existed). */
+/** Crypto taker-fee rate in effect at a timestamp (measured 0 — see schedule note). */
 export function cryptoFeeRate(tsSeconds: number): number {
   let rate = 0;
   for (const p of CRYPTO_FEE_SCHEDULE) if (tsSeconds >= p.fromTs) rate = p.rate;

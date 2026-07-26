@@ -802,13 +802,14 @@ async function cmdAnalyze(args: Args): Promise<void> {
     out.feeRole.push(fr);
     const amtRate = fr.txAmountChecked ? fr.txAmountMatched / fr.txAmountChecked : 1;
     const roleRate = fr.roleChecked ? fr.roleAgreed / fr.roleChecked : 1;
+    const amtRateV2 = fr.txAmountCheckedV2 ? fr.txAmountMatchedV2 / fr.txAmountCheckedV2 : 1;
     console.log(`  on-chain (${fr.txs} txs, ${fr.legs} legs; ${fr.makerLegs} maker / ${fr.takerLegs} taker; mint-matches ${fr.mintTxs} txs/${fr.mintLegs} legs):`);
-    console.log(`    decode gate (standard txs): amounts matched ${fr.txAmountMatched}/${fr.txAmountChecked} (${pct(amtRate)}) · maker-fee violations ${fr.makerLegFeeViolations}`);
+    console.log(`    decode gate: post-V2 amounts ${fr.txAmountMatchedV2}/${fr.txAmountCheckedV2} (${pct(amtRateV2)}) · post-V2 maker-fee violations ${fr.makerLegFeeViolationsV2}  [all-era: ${fr.txAmountMatched}/${fr.txAmountChecked}, viol ${fr.makerLegFeeViolations} — V1 gross/fee-word quirks documented]`);
     console.log(`    role gate:   API vs chain agreed ${fr.roleAgreed}/${fr.roleChecked} (${pct(roleRate)}) · mixed-role txs ${fr.roleMixedTxs}`);
     console.log(`    fees (standard txs): ${fr.feeLegs} fee-bearing legs, total ${usd(fr.feeTotal)} · rate pre-V2 ${(100 * measuredFeeRate(fr, "pre-V2")).toFixed(3)}% · post-V2 ${(100 * measuredFeeRate(fr, "post-V2")).toFixed(3)}%`);
     if (fr.mintFeeWordLegs > 0) console.log(`    mint fee-word artifact: ${fr.mintFeeWordLegs}/${fr.mintLegs} mint legs carry a nonzero fee word (no cash left the wallet — see report)`);
-    if (amtRate < 0.99 && fr.txAmountChecked > 0) gateFailures.push(`${label}: amount decode ${pct(amtRate)} < 99%`);
-    if (fr.makerLegFeeViolations > 0) gateFailures.push(`${label}: ${fr.makerLegFeeViolations} maker legs with fee ≠ 0`);
+    if (amtRateV2 < 0.99 && fr.txAmountCheckedV2 > 0) gateFailures.push(`${label}: post-V2 amount decode ${pct(amtRateV2)} < 99%`);
+    if (fr.makerLegFeeViolationsV2 > 0) gateFailures.push(`${label}: ${fr.makerLegFeeViolationsV2} post-V2 maker legs with fee ≠ 0`);
     if (roleRate < 0.99 && fr.roleChecked > 0) gateFailures.push(`${label}: role agreement ${pct(roleRate)} < 99%`);
 
     // Feed-gap classification (pre-V2 wallets only produce samples)

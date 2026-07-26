@@ -62,10 +62,19 @@ export interface FeeRoleResult {
   mintTxs: number;
   mintLegs: number;
   mintFeeWordLegs: number; // mint legs with a nonzero fee word (artifact, see above)
-  /** empirical decode gate — STANDARD (non-mint) txs only */
+  /**
+   * empirical decode gate — STANDARD (non-mint) txs only. The HARD gate is
+   * era-scoped to post-V2: V1 legs occasionally emit GROSS amounts (~3%
+   * above what the wallet verifiably received — share conservation closes on
+   * the API amounts) and carry the unsettled fee word, so V1 figures are
+   * documentary, not gating.
+   */
   txAmountMatched: number;
   txAmountChecked: number;
-  makerLegFeeViolations: number; // standard maker legs with fee != 0 (must be 0)
+  txAmountMatchedV2: number;
+  txAmountCheckedV2: number;
+  makerLegFeeViolations: number; // standard maker legs with fee != 0 (all eras, informational)
+  makerLegFeeViolationsV2: number; // post-V2 only — the hard gate (must be 0)
   /** measured fees — STANDARD txs only */
   feeLegs: number;
   feeTotal: number;
@@ -103,7 +112,10 @@ export function analyzeFeeRole(db: Db, entries: ChainSampleEntry[], wallet: stri
     mintFeeWordLegs: 0,
     txAmountMatched: 0,
     txAmountChecked: 0,
+    txAmountMatchedV2: 0,
+    txAmountCheckedV2: 0,
     makerLegFeeViolations: 0,
+    makerLegFeeViolationsV2: 0,
     feeLegs: 0,
     feeTotal: 0,
     feeByEra: [
@@ -149,7 +161,10 @@ export function analyzeFeeRole(db: Db, entries: ChainSampleEntry[], wallet: stri
       const eraBucket = res.feeByEra[era];
       eraBucket.legs++;
       eraBucket.notional += cash;
-      if (l.role === "maker" && l.fee > 1e-9) res.makerLegFeeViolations++;
+      if (l.role === "maker" && l.fee > 1e-9) {
+        res.makerLegFeeViolations++;
+        if (era === 1) res.makerLegFeeViolationsV2++;
+      }
       if (l.fee > 1e-9) {
         res.feeLegs++;
         res.feeTotal += l.fee;
@@ -161,8 +176,13 @@ export function analyzeFeeRole(db: Db, entries: ChainSampleEntry[], wallet: stri
 
     // Amount gate (standard txs): Σ on-chain wallet shares vs Σ local sizes.
     if (!isMint && local.n > 0 && legs.length > 0) {
+      const ok = Math.abs(chainShares - local.qty) < Math.max(0.05, local.qty * 1e-4);
       res.txAmountChecked++;
-      if (Math.abs(chainShares - local.qty) < Math.max(0.05, local.qty * 1e-4)) res.txAmountMatched++;
+      if (ok) res.txAmountMatched++;
+      if (era === 1) {
+        res.txAmountCheckedV2++;
+        if (ok) res.txAmountMatchedV2++;
+      }
     }
 
     // Role gate (all txs with API truth available): roles come from indexed
