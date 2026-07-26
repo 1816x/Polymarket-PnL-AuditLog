@@ -20,7 +20,7 @@ import { getRequestCount as reqCount } from "./clients/http.ts";
 import { polygonRpcUrls } from "./config/constants.ts";
 import { resolveSubjects } from "./ingest/resolve-wallets.ts";
 import type { ResolvedSubject } from "./ingest/resolve-wallets.ts";
-import { openDb } from "./store/schema.ts";
+import { openDb, openDbReadOnly } from "./store/schema.ts";
 import { Repository } from "./store/repository.ts";
 import { ingestFills, topUpFills } from "./ingest/fetch-fills.ts";
 import { ingestActivity, topUpActivity } from "./ingest/fetch-activity.ts";
@@ -28,6 +28,14 @@ import { rebuildFills } from "./ingest/rebuild-fills.ts";
 import { collectVolume, formatVolume, sampleSettlement } from "./ingest/report.ts";
 import { backfillMarkets, backfillPlan } from "./ingest/fetch-markets.ts";
 import { buildDerived, walletSummaries, formatSummaries, exportArtifacts } from "./analysis/pnl.ts";
+import { sampleResolvedMarkets } from "./analysis/sampling.ts";
+import { ingestTakerFills } from "./ingest/fetch-taker.ts";
+import { buildChainSample, fetchChainSample } from "./ingest/fetch-onchain.ts";
+import type { ChainSampleEntry } from "./ingest/fetch-onchain.ts";
+import { walletMakerTaker } from "./analysis/maker-taker.ts";
+import { analyzeFeeRole, analyzeFeedGap, measuredFeeRate } from "./analysis/fees.ts";
+import { decomposeWallet } from "./analysis/decompose.ts";
+import { walletStats } from "./analysis/stats.ts";
 
 const OUT_DIR = "output/phase0";
 const DEFAULT_WALLET = "0xfcdc071df7080c214196bb0b3b751e5417f9d8e3"; // neversmiling (resolved)
@@ -459,6 +467,87 @@ async function cmdPnl(args: Args): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// mt-ingest (Phase 3 / H2) — taker-subset download for the market sample
+// ---------------------------------------------------------------------------
+async function cmdMtIngest(args: Args): Promise<void> {
+  const db = openDb();
+  const repo = new Repository(db);
+  const wallets = await usableWallets(args.wallet);
+  const target = args.samples >= 100 ? args.samples : 400; // markets per wallet
+
+  const samples = wallets.flatMap((w) => sampleResolvedMarkets(db, w.address as string, target));
+  if (args.dryRun) {
+    console.log("PHASE 3 — mt-ingest [dry-run]\n");
+    for (const w of wallets) {
+      const s = samples.filter((x) => x.wallet === w.address);
+      console.log(`  ${w.label}: ${s.length} sampled markets across ${new Set(s.map((x) => x.month)).size} months`);
+    }
+    console.log(`\n  total ${samples.length} markets ≈ ${samples.length}+ requests (1 per market, cursor-walk if >10k rows).`);
+    console.log("  Raw cache: data/raw/taker/<wallet>/<conditionId>.ndjson.gz (existing files replayed). No calls made.");
+    db.close();
+    return;
+  }
+
+  stamp(`▶ mt-ingest: taker subset for ${samples.length} sampled markets`);
+  const res = await ingestTakerFills(repo, samples, { concurrency: args.concurrency, delayMs: args.delayMs, log: stamp });
+  hr();
+  console.log(`markets=${res.markets} (replayed ${res.replayed})  takerRows=${res.takerRows}  cursorWalked=${res.fullPages}`);
+  // Quick per-wallet preview by notional (full analysis in `analyze`).
+  for (const w of wallets) {
+    const addr = w.address as string;
+    const t = db
+      .prepare(
+        `SELECT COALESCE(SUM(size * price), 0) v, COUNT(*) n FROM taker_fills WHERE wallet = ?`,
+      )
+      .get(addr) as { v: number; n: number };
+    const f = db
+      .prepare(
+        `SELECT COALESCE(SUM(p.buyCost + p.sellProceeds), 0) v, COALESCE(SUM(p.fillCount), 0) n
+         FROM positions p WHERE p.wallet = ? AND p.conditionId IN (SELECT DISTINCT conditionId FROM taker_fills WHERE wallet = ?)`,
+      )
+      .get(addr, addr) as { v: number; n: number };
+    const shareN = f.n > 0 ? (100 * t.n) / f.n : 0;
+    const shareV = f.v > 0 ? (100 * t.v) / f.v : 0;
+    console.log(`  ${w.label}: taker ≈ ${shareN.toFixed(1)}% of fills, ${shareV.toFixed(1)}% of notional (sampled mkts)`);
+  }
+  console.log(`\nRequests made: ${reqCount()}`);
+  db.close();
+}
+
+// ---------------------------------------------------------------------------
+// chain-sample (Phase 3 / B) — on-chain receipts for fees, role validation,
+// and feed-gap classification. Writes files only (concurrent-safe vs mt-ingest).
+// ---------------------------------------------------------------------------
+async function cmdChainSample(args: Args): Promise<void> {
+  // Read-only open: this command runs concurrently with mt-ingest (the DB
+  // writer) and must not issue DDL/pragma writes.
+  const db = openDbReadOnly();
+  const wallets = (await usableWallets(args.wallet)).map((w) => w.address as string);
+  const entries = buildChainSample(db, wallets);
+  db.close(); // everything below is file/network only
+
+  const byKind = new Map<string, number>();
+  for (const e of entries) byKind.set(e.kind, (byKind.get(e.kind) ?? 0) + 1);
+
+  if (args.dryRun) {
+    console.log("PHASE 3 — chain-sample [dry-run]\n");
+    for (const [k, n] of byKind) console.log(`  ${k}: ${n} txs`);
+    console.log(`  total ${entries.length} receipts via Polygon RPC (failover: ${polygonRpcUrls().length} endpoints)`);
+    console.log("  Raw cache: data/raw/receipts/<tx>.json.gz (existing files skipped). No calls made.");
+    return;
+  }
+
+  stamp(`▶ chain-sample: ${entries.length} receipts (${[...byKind].map(([k, n]) => `${k}:${n}`).join(", ")})`);
+  const res = await fetchChainSample(entries, { concurrency: args.concurrency, delayMs: args.delayMs, log: stamp });
+  await mkdir("output/phase3", { recursive: true });
+  await writeFile("output/phase3/chain-manifest.json", JSON.stringify({ generatedAt: new Date().toISOString(), entries }, null, 1));
+  hr();
+  console.log(`fetched=${res.fetched}  cached=${res.cached}  failed=${res.failed.length} of ${res.total}`);
+  if (res.failed.length) console.log(`  failed txs (retry by re-running): ${res.failed.slice(0, 5).join(", ")}${res.failed.length > 5 ? "…" : ""}`);
+  console.log(`  ↳ wrote output/phase3/chain-manifest.json`);
+}
+
+// ---------------------------------------------------------------------------
 // validate (Phase 2) — reconcile our per-market cash PnL against Polymarket's
 // own realizedPnl (/closed-positions), plus wallet-level context numbers.
 // Polymarket's figures are a CROSS-CHECK, never our source (spec).
@@ -667,6 +756,106 @@ async function cmdExplain(args: Args): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// analyze (Phase 3) — fully offline: H2 (maker/taker + fees), H3
+// (decomposition), H1 stats. Reads taker_fills + cached receipts + market_pnl.
+// ---------------------------------------------------------------------------
+async function cmdAnalyze(args: Args): Promise<void> {
+  const db = openDbReadOnly();
+  const wallets = await usableWallets(args.wallet);
+  const labels = new Map(wallets.map((w) => [w.address as string, w.label]));
+
+  if (args.dryRun) {
+    console.log("[dry-run] analyze runs fully offline over taker_fills, cached receipts and market_pnl,");
+    console.log("          writing output/phase3/{maker-taker,fees,decomposition,stats}.json. No calls made.");
+    db.close();
+    return;
+  }
+
+  // Receipt manifest: reuse the persisted one; else rebuild (deterministic).
+  let entries: ChainSampleEntry[];
+  try {
+    entries = JSON.parse(await (await import("node:fs/promises")).readFile("output/phase3/chain-manifest.json", "utf8")).entries;
+  } catch {
+    entries = buildChainSample(db, wallets.map((w) => w.address as string));
+  }
+
+  const pct = (x: number) => (100 * x).toFixed(1) + "%";
+  const usd = (n: number) => (n < 0 ? "-$" : "$") + Math.abs(n).toLocaleString("en-US", { maximumFractionDigits: 0 });
+  const out: Record<string, unknown[]> = { makerTaker: [], feeRole: [], feedGap: [], decomposition: [], stats: [] };
+  const gateFailures: string[] = [];
+
+  for (const w of wallets) {
+    const addr = w.address as string;
+    const label = labels.get(addr) ?? addr.slice(0, 10);
+    hr();
+    console.log(`■ ${label}  (${addr})`);
+
+    // H2a — maker/taker from the taker-subset sample
+    const mt = walletMakerTaker(db, addr);
+    out.makerTaker.push(mt);
+    console.log(`  maker/taker (n=${mt.marketsSampled} sampled mkts):`);
+    console.log(`    taker share — rows ${pct(mt.takerShareRows)} · qty ${pct(mt.takerShareQty)} · notional ${pct(mt.takerShareNotional)} (95% CI ${pct(mt.takerNotionalCI95.lo)}–${pct(mt.takerNotionalCI95.hi)})`);
+    for (const e of mt.byEra) if (e.markets > 0) console.log(`    ${e.era}: taker ${pct(e.takerShareNotional)} over ${e.markets} mkts`);
+
+    // H2b — on-chain fees + role validation
+    const fr = analyzeFeeRole(db, entries, addr);
+    out.feeRole.push(fr);
+    const amtRate = fr.txAmountChecked ? fr.txAmountMatched / fr.txAmountChecked : 1;
+    const roleRate = fr.roleChecked ? fr.roleAgreed / fr.roleChecked : 1;
+    console.log(`  on-chain (${fr.txs} txs, ${fr.legs} legs; ${fr.makerLegs} maker / ${fr.takerLegs} taker; mint-matches ${fr.mintTxs} txs/${fr.mintLegs} legs):`);
+    console.log(`    decode gate (standard txs): amounts matched ${fr.txAmountMatched}/${fr.txAmountChecked} (${pct(amtRate)}) · maker-fee violations ${fr.makerLegFeeViolations}`);
+    console.log(`    role gate:   API vs chain agreed ${fr.roleAgreed}/${fr.roleChecked} (${pct(roleRate)}) · mixed-role txs ${fr.roleMixedTxs}`);
+    console.log(`    fees (standard txs): ${fr.feeLegs} fee-bearing legs, total ${usd(fr.feeTotal)} · rate pre-V2 ${(100 * measuredFeeRate(fr, "pre-V2")).toFixed(3)}% · post-V2 ${(100 * measuredFeeRate(fr, "post-V2")).toFixed(3)}%`);
+    if (fr.mintFeeWordLegs > 0) console.log(`    mint fee-word artifact: ${fr.mintFeeWordLegs}/${fr.mintLegs} mint legs carry a nonzero fee word (no cash left the wallet — see report)`);
+    if (amtRate < 0.99 && fr.txAmountChecked > 0) gateFailures.push(`${label}: amount decode ${pct(amtRate)} < 99%`);
+    if (fr.makerLegFeeViolations > 0) gateFailures.push(`${label}: ${fr.makerLegFeeViolations} maker legs with fee ≠ 0`);
+    if (roleRate < 0.99 && fr.roleChecked > 0) gateFailures.push(`${label}: role agreement ${pct(roleRate)} < 99%`);
+
+    // Feed-gap classification (pre-V2 wallets only produce samples)
+    const fg = analyzeFeedGap(db, entries, addr);
+    out.feedGap.push(fg);
+    if (fg.marketsSampled > 0) {
+      console.log(`  feed-gap: ${fg.marketsSampled} inflow mkts sampled (${usd(fg.sampledInflowValue)}) — mint evidence in ${fg.marketsWithMintEvidence} (${usd(fg.inflowValueWithMintEvidence)}, ${pct(fg.sampledInflowValue > 0 ? fg.inflowValueWithMintEvidence / fg.sampledInflowValue : 0)}), direct transfers-in ${fg.marketsWithDirectTransferIn}`);
+    }
+
+    // H3 — decomposition
+    const dec = decomposeWallet(db, addr);
+    out.decomposition.push(dec);
+    console.log(`  H3 decomposition (${dec.markets} resolved mkts, identityErr ${dec.identityError.toExponential(1)}):`);
+    console.log(`    paired ${usd(dec.pairedPnl)} + directional ${usd(dec.directionalPnl)} = ${usd(dec.totalPnl)}`);
+    console.log(`    both-sides mkts ${dec.bothSidesMkts} · single-leg mkts ${dec.singleLegMkts} (PnL ${usd(dec.singleLegPnl)} — invisible to the article's pair metric)`);
+    if (dec.pairCost) {
+      console.log(`    pair cost (weighted): mean $${dec.pairCost.weightedMean.toFixed(4)} · p5 $${dec.pairCost.p5.toFixed(3)} · p50 $${dec.pairCost.p50.toFixed(3)} · p95 $${dec.pairCost.p95.toFixed(3)} · ${pct(dec.pairCost.sharePairsUnder1)} of ${Math.round(dec.pairCost.pairsTotal).toLocaleString("en-US")} sets < $1`);
+    }
+    if (Math.abs(dec.identityError) > 1) gateFailures.push(`${label}: decomposition identity error ${dec.identityError}`);
+
+    // H1 — statistics
+    const st = walletStats(db, addr);
+    out.stats.push(st);
+    console.log(`  H1 stats (${st.markets} mkts):`);
+    console.log(`    mean/mkt $${st.meanPnl.toFixed(4)} (95% CI $${st.meanCI95.lo.toFixed(4)}…$${st.meanCI95.hi.toFixed(4)}) → total ${usd(st.totalPnl)} (CI ${usd(st.totalCI95.lo)}…${usd(st.totalCI95.hi)})`);
+    console.log(`    median $${st.median.toFixed(3)} · p5 $${st.p5.toFixed(2)} · p95 $${st.p95.toFixed(2)} · positive mkts ${pct(st.pctPositive)} (zero: ${pct(st.pctZero)})`);
+    console.log(`    max drawdown ${usd(st.maxDrawdown)} (${st.maxDrawdownDay ?? "—"}) · peak capital ${usd(st.peakCapital)} (${st.peakCapitalDay ?? "—"}) · return on peak ${st.returnOnPeakCapital === null ? "—" : pct(st.returnOnPeakCapital)}`);
+  }
+
+  hr();
+  if (gateFailures.length) {
+    console.log("⚠ GATES FAILED (spec §8 — investigate before publishing):");
+    for (const g of gateFailures) console.log("  · " + g);
+  } else {
+    console.log("All Phase-3 gates passed (decode ≥99%, maker fee = 0, role agreement ≥99%, identity ≤ $1).");
+  }
+
+  await mkdir("output/phase3", { recursive: true });
+  for (const [name, data] of Object.entries(out)) {
+    const file = `output/phase3/${name === "makerTaker" ? "maker-taker" : name === "feeRole" ? "fees" : name === "feedGap" ? "feed-gap" : name}.json`;
+    await writeFile(file, JSON.stringify({ generatedAt: new Date().toISOString(), wallets: data }, null, 1));
+    console.log(`  ↳ wrote ${file}`);
+  }
+  db.close();
+}
+
+// ---------------------------------------------------------------------------
 // volume — print the report from the store (pass --sample 0 to skip network)
 // ---------------------------------------------------------------------------
 async function cmdVolume(args: Args): Promise<void> {
@@ -725,6 +914,15 @@ async function main(): Promise<void> {
       break;
     case "pnl":
       await cmdPnl(args);
+      break;
+    case "mt-ingest":
+      await cmdMtIngest(args);
+      break;
+    case "chain-sample":
+      await cmdChainSample(args);
+      break;
+    case "analyze":
+      await cmdAnalyze(args);
       break;
     case "validate":
       await cmdValidate(args);

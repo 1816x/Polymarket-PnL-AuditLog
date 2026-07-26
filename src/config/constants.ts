@@ -71,6 +71,36 @@ export function eraFor(tsSeconds: number): ExchangeEra {
 export const ORDER_FILLED_TOPIC_V2 =
   "0xd543adfd945773f1a62f74f0ee55a5e3b9b1a28262980ba90b1a89f2ea84d8ee";
 
+/**
+ * V1 CTF Exchange OrderFilled — matches the canonical
+ * OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)
+ * signature and was OBSERVED on-chain (Phase 3 calibration, real pre-cutover
+ * fill receipts) with the SAME 5-word data layout as V2.
+ */
+export const ORDER_FILLED_TOPIC_V1 =
+  "0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6";
+
+export const ORDER_FILLED_TOPICS = new Set<string>([ORDER_FILLED_TOPIC_V1, ORDER_FILLED_TOPIC_V2]);
+
+/**
+ * Conditional-Tokens (CTF) + ERC-1155 event topics used by the Phase-3
+ * feed-gap classifier. Every hash below was captured from REAL receipts of
+ * this dataset's own fill/merge/redeem transactions (Phase 3 calibration,
+ * 2026-07-26) — not computed from assumed signatures.
+ */
+export const CTF_TOPICS = {
+  /** ERC-1155 TransferBatch(operator, from, to, ids[], values[]) — canonical. */
+  transferBatch: "0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb",
+  /** ERC-1155 TransferSingle(operator, from, to, id, value) — canonical. */
+  transferSingle: "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62",
+  /** CTF PositionSplit — collateral minted into an outcome pair (mint-match legs). */
+  positionSplit: "0x2e6bb91f8cbcda0c93623c54d0403a43514fabc40084ec96b6d5379a74786298",
+  /** CTF PositionsMerge — outcome pair burned back to collateral. */
+  positionsMerge: "0x6f13ca62553fcc2bcd2372180a43949c1e4cebba603901ede2f4e14f36b282ca",
+  /** CTF PayoutRedemption — winning shares redeemed for collateral. */
+  payoutRedemption: "0x2682012a4a4f1973119f1c9b90745d1bd91fa2bab387344f044cb3586864d18d",
+} as const;
+
 /** Fixed-point scale for USDC.e / pUSD and for outcome-token share amounts (6 dp). */
 export const TOKEN_DECIMALS = 6;
 export const TOKEN_SCALE = 10 ** TOKEN_DECIMALS;

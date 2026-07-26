@@ -19,7 +19,7 @@
  */
 import {
   EXCHANGE_ADDRESSES,
-  ORDER_FILLED_TOPIC_V2,
+  ORDER_FILLED_TOPICS,
   TOKEN_SCALE,
   polygonRpcUrls,
 } from "../config/constants.ts";
@@ -66,10 +66,25 @@ export interface OrderFilledFill {
   fee: number; // provisional decode, human units — expect 0 on maker legs
 }
 
-/** Fetch a transaction receipt via Polygon RPC (with endpoint failover). */
+/**
+ * Fetch a transaction receipt via Polygon RPC with endpoint failover.
+ *
+ * IMPORTANT: a `null` result is a VALID JSON-RPC response ("I don't have this
+ * tx") that load-balanced public fleets return when a pruned/lagging replica
+ * answers — so null must trigger failover to the next endpoint, not be
+ * accepted. Only when every endpoint says null/errors do we give up. (Without
+ * this, ~75% of months-old receipts came back null from the first endpoint.)
+ */
 export async function getTransactionReceipt(txHash: string): Promise<RpcReceipt | null> {
-  const res = await rpcCall(polygonRpcUrls(), "eth_getTransactionReceipt", [txHash]);
-  return (res as RpcReceipt | null) ?? null;
+  for (const url of polygonRpcUrls()) {
+    try {
+      const res = await rpcCall([url], "eth_getTransactionReceipt", [txHash]);
+      if (res) return res as RpcReceipt;
+    } catch {
+      // endpoint errored — try the next one
+    }
+  }
+  return null;
 }
 
 /**
@@ -82,7 +97,9 @@ export function extractWalletFills(receipt: RpcReceipt, wallet: string): OrderFi
   const out: OrderFilledFill[] = [];
   for (const log of receipt.logs) {
     if (!EXCHANGE_ADDRESSES.has(log.address.toLowerCase())) continue;
-    if (log.topics[0]?.toLowerCase() !== ORDER_FILLED_TOPIC_V2) continue;
+    // V1 and V2 events share the 5-word data layout (verified on real
+    // receipts of both eras — Phase 3 calibration).
+    if (!ORDER_FILLED_TOPICS.has(log.topics[0]?.toLowerCase() ?? "")) continue;
     if (log.topics.length < 4) continue;
 
     const maker = topicToAddress(log.topics[2]);

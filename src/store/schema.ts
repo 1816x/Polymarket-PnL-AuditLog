@@ -16,6 +16,16 @@ export const DB_PATH = "data/audit.db";
 
 export type Db = DatabaseSync;
 
+/**
+ * Read-only connection: no DDL, no pragmas that could take write locks. Use
+ * for commands that must run concurrently with a writing ingest (WAL: many
+ * readers, one writer) — openDb()'s CREATE/ALTER statements would otherwise
+ * block on the writer.
+ */
+export function openDbReadOnly(path: string = DB_PATH): Db {
+  return new DatabaseSync(path, { readOnly: true });
+}
+
 export function openDb(path: string = DB_PATH): Db {
   mkdirSync(dirname(path), { recursive: true });
   const db = new DatabaseSync(path);
@@ -58,6 +68,7 @@ export function openDb(path: string = DB_PATH): Db {
       PRIMARY KEY (wallet, type, ts, conditionId, tx, usdcSize)
     );
     CREATE INDEX IF NOT EXISTS idx_activity_wallet_type ON activity (wallet, type);
+    CREATE INDEX IF NOT EXISTS idx_activity_cond        ON activity (conditionId);
 
     CREATE TABLE IF NOT EXISTS markets (
       conditionId         TEXT PRIMARY KEY,
@@ -80,6 +91,25 @@ export function openDb(path: string = DB_PATH): Db {
       settlementPrice REAL
     );
     CREATE INDEX IF NOT EXISTS idx_tokens_cond ON tokens (conditionId);
+
+    -- Phase 3 (H2): the TAKER SUBSET of fills for a deterministic sample of
+    -- markets, from /trades?takerOnly=true&market=. Same shape + seq semantics
+    -- as fills; a fills row of a sampled market that is absent here is a MAKER
+    -- fill. Only sampled markets are covered (see analysis/sampling.ts).
+    CREATE TABLE IF NOT EXISTS taker_fills (
+      wallet       TEXT    NOT NULL,
+      tx           TEXT    NOT NULL,
+      asset        TEXT    NOT NULL,
+      conditionId  TEXT    NOT NULL,
+      side         TEXT    NOT NULL,
+      size         REAL    NOT NULL,
+      price        REAL    NOT NULL,
+      ts           INTEGER NOT NULL,
+      outcomeIndex INTEGER,
+      seq          INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (wallet, tx, asset, side, size, price, ts, seq)
+    );
+    CREATE INDEX IF NOT EXISTS idx_taker_wc ON taker_fills (wallet, conditionId);
 
     -- Resume state: one row per (dataset:wallet) ingest stream.
     CREATE TABLE IF NOT EXISTS checkpoints (
