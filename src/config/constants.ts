@@ -18,6 +18,15 @@
 export const GAMMA_API = "https://gamma-api.polymarket.com";
 export const DATA_API = "https://data-api.polymarket.com";
 export const CLOB_API = "https://clob.polymarket.com";
+export const LB_API = "https://lb-api.polymarket.com"; // leaderboard: /profit, /volume by address
+
+/** The 4 audited subject wallets — excluded from the Phase-5 control pool. */
+export const SUBJECT_ADDRESSES = new Set<string>([
+  "0xb27bc932bf8110d8f78e55da7d5f0497a18b5b82",
+  "0xb0f85baa97990910a3e8ac2b4a58a322f01ecef5",
+  "0xce25e214d5cfe4f459cf67f08df581885aae7fdc",
+  "0xfcdc071df7080c214196bb0b3b751e5417f9d8e3",
+]);
 
 // ---------------------------------------------------------------------------
 // Polygon (chainId 137) contracts — confirmed via PolygonScan labels + on-chain

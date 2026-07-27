@@ -9,7 +9,7 @@
  * not trusted from the REDEEM row.
  */
 import { z } from "zod";
-import { DATA_API } from "../config/constants.ts";
+import { DATA_API, LB_API } from "../config/constants.ts";
 import { getJson } from "./http.ts";
 
 const TradeSchema = z.object({
@@ -153,6 +153,37 @@ export async function getPortfolioValue(user: string): Promise<number | null> {
   if (arr.success && arr.data[0]) return arr.data[0].value;
   const obj = z.object({ value: z.number() }).safeParse(raw);
   return obj.success ? obj.data.value : null;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5 control group — market participants + leaderboard PnL/volume.
+// ---------------------------------------------------------------------------
+
+/**
+ * All trades in a market, WITHOUT a user filter — the participant list for the
+ * control-group sampling frame. One page (default 500) is enough to sample
+ * participants; we are not enumerating every trade (documented in the report).
+ */
+export async function getMarketTrades(conditionId: string, limit = 500): Promise<Trade[]> {
+  const p = new URLSearchParams({ market: conditionId, takerOnly: "false", limit: String(limit) });
+  const raw = await getJson(`${DATA_API}/trades?${p.toString()}`, { label: `data /trades market ${conditionId.slice(0, 10)}` });
+  return z.array(TradeSchema).parse(raw);
+}
+
+const LbEntrySchema = z.object({ proxyWallet: z.string(), amount: z.number(), name: z.string().nullable().optional() });
+
+/** All-time realized profit for an address (Polymarket's own number — the same metric used for the subjects). */
+export async function getLeaderboardProfit(address: string): Promise<number | null> {
+  const raw = await getJson(`${LB_API}/profit?window=all&address=${encodeURIComponent(address)}`, { label: `lb /profit ${address.slice(0, 10)}` });
+  const arr = z.array(LbEntrySchema).safeParse(raw);
+  return arr.success && arr.data[0] ? arr.data[0].amount : null;
+}
+
+/** All-time traded volume (USDC) for an address. */
+export async function getLeaderboardVolume(address: string): Promise<number | null> {
+  const raw = await getJson(`${LB_API}/volume?window=all&address=${encodeURIComponent(address)}`, { label: `lb /volume ${address.slice(0, 10)}` });
+  const arr = z.array(LbEntrySchema).safeParse(raw);
+  return arr.success && arr.data[0] ? arr.data[0].amount : null;
 }
 
 /** Fetch a page of activity rows for a wallet (limit capped at 500 by the API). */

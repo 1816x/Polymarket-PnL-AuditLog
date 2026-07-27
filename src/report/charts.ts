@@ -296,3 +296,81 @@ export function pairCostBoxSvg(boxes: BoxStat[], opts: { title: string; subtitle
   }
   return g + "</svg>\n";
 }
+
+// --- 5. histogram with marker lines (control-group PnL distribution) --------
+
+export interface HistBin {
+  x0: number;
+  x1: number;
+  count: number;
+}
+export interface Marker {
+  value: number;
+  label: string;
+  color: string;
+}
+/**
+ * Vertical histogram over signed values, with a zero rule and labeled marker
+ * lines (the 4 subjects placed in the control distribution). Bars left of zero
+ * are losses (red-ish), right are gains (green-ish).
+ */
+export function histogramSvg(
+  bins: HistBin[],
+  markers: Marker[],
+  opts: { title: string; subtitle?: string; xLabel?: string },
+): string {
+  const f: Frame = { w: 920, h: 460, padL: 56, padR: 24, padT: 84, padB: 62 };
+  const plotW = f.w - f.padL - f.padR;
+  const plotH = f.h - f.padT - f.padB;
+  const xLo = Math.min(...bins.map((b) => b.x0), ...markers.map((m) => m.value));
+  const xHi = Math.max(...bins.map((b) => b.x1), ...markers.map((m) => m.value));
+  const cMax = Math.max(1, ...bins.map((b) => b.count));
+  const sx = (v: number) => f.padL + ((v - xLo) / Math.max(1e-9, xHi - xLo)) * plotW;
+  const sy = (c: number) => f.padT + plotH - (c / cMax) * plotH;
+
+  let g = open(f, opts.title) + titleEl(f, opts.title, opts.subtitle);
+
+  // y gridlines
+  for (let i = 0; i <= 4; i++) {
+    const cv = (cMax * i) / 4;
+    g += `<line x1="${f.padL}" y1="${n(sy(cv))}" x2="${f.padL + plotW}" y2="${n(sy(cv))}" stroke="${GRID}" stroke-width="1"/>`;
+    g += text(f.padL - 7, sy(cv) + 4, String(Math.round(cv)), { anchor: "end", size: 10, fill: MUTED });
+  }
+  // bars
+  for (const b of bins) {
+    const x = sx(b.x0);
+    const w = Math.max(1, sx(b.x1) - sx(b.x0) - 1.5);
+    const y = sy(b.count);
+    const mid = (b.x0 + b.x1) / 2;
+    g += `<rect x="${n(x)}" y="${n(y)}" width="${n(w)}" height="${n(sy(0) - y)}" rx="1.5" fill="${mid < 0 ? NEG : POS}" fill-opacity="0.55"/>`;
+  }
+  // zero rule
+  if (xLo < 0 && xHi > 0) {
+    const z = sx(0);
+    g += `<line x1="${n(z)}" y1="${f.padT}" x2="${n(z)}" y2="${n(sy(0))}" stroke="${MUTED}" stroke-width="1.25"/>`;
+    g += text(z, f.padT - 6, "break-even", { anchor: "middle", size: 10, fill: MUTED });
+  }
+  // x axis baseline + ticks
+  g += `<line x1="${f.padL}" y1="${n(sy(0))}" x2="${f.padL + plotW}" y2="${n(sy(0))}" stroke="${INK2}" stroke-width="1"/>`;
+  for (let k = 0; k <= 4; k++) {
+    const v = xLo + ((xHi - xLo) * k) / 4;
+    g += text(sx(v), f.h - f.padB + 18, fmtUsd(v), { anchor: "middle", size: 10, fill: MUTED });
+  }
+  if (opts.xLabel) g += text(f.padL + plotW / 2, f.h - 8, opts.xLabel, { anchor: "middle", size: 11, fill: INK2 });
+
+  // markers (subjects), staggered labels to avoid overlap
+  const ms = markers.map((m) => ({ ...m, x: sx(m.value) })).sort((a, b) => a.x - b.x);
+  let lastLabelX = -Infinity;
+  let tier = 0;
+  for (const m of ms) {
+    g += `<line x1="${n(m.x)}" y1="${f.padT - 2}" x2="${n(m.x)}" y2="${n(sy(0))}" stroke="${m.color}" stroke-width="2"/>`;
+    g += `<circle cx="${n(m.x)}" cy="${n(f.padT - 2)}" r="3" fill="${m.color}"/>`;
+    // stagger label vertical tier if close to the previous
+    if (m.x - lastLabelX < 90) tier = (tier + 1) % 2;
+    else tier = 0;
+    lastLabelX = m.x;
+    const ly = f.padT + 12 + tier * 16;
+    g += text(m.x + 5, ly, m.label, { size: 10.5, fill: m.color, weight: 700 });
+  }
+  return g + "</svg>\n";
+}

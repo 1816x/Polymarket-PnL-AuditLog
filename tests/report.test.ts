@@ -12,9 +12,11 @@ import {
   divergingBarsSvg,
   pairCostBoxSvg,
   groupedBarsSvg,
+  histogramSvg,
   fmtUsd,
   PALETTE,
 } from "../src/report/charts.ts";
+import { analyzeControl, histogramBins } from "../src/analysis/control.ts";
 
 /** A chart string must be a single well-formed <svg>…</svg> with no NaN/Infinity. */
 function assertValidSvg(svg: string) {
@@ -89,6 +91,43 @@ test("groupedBarsSvg renders grouped bars with a legend", () => {
     { title: "Recon", legend: ["ours", "theirs"] },
   );
   assertValidSvg(svg);
+});
+
+test("histogramSvg renders bins, a zero rule and subject markers", () => {
+  const bins = [
+    { x0: -20000, x1: -10000, count: 8 },
+    { x0: -10000, x1: 0, count: 20 },
+    { x0: 0, x1: 10000, count: 15 },
+    { x0: 10000, x1: 20000, count: 4 },
+  ];
+  const svg = histogramSvg(
+    bins,
+    [
+      { value: 18000, label: "b27 (99%)", color: PALETTE[0] },
+      { value: 5000, label: "ns (80%)", color: PALETTE[1] },
+    ],
+    { title: "Control", subtitle: "test", xLabel: "profit" },
+  );
+  assertValidSvg(svg);
+  assert.match(svg, /break-even/);
+});
+
+test("analyzeControl computes percentiles and % profitable", () => {
+  const metrics = [
+    { wallet: "0xa", appearances: 5, profit: -500, volume: 1000 },
+    { wallet: "0xb", appearances: 5, profit: -100, volume: 2000 },
+    { wallet: "0xc", appearances: 5, profit: 50, volume: 3000 },
+    { wallet: "0xd", appearances: 5, profit: 200, volume: 4000 },
+    { wallet: "0xe", appearances: 5, profit: null, volume: null }, // unknown /profit
+  ];
+  const stats = analyzeControl(metrics, [{ label: "subj", wallet: "0xsubj", profit: 100000 }]);
+  assert.equal(stats.n, 4);
+  assert.equal(stats.nUnknown, 1);
+  assert.equal(stats.pctProfitable, 0.5); // 2 of 4 > 0
+  assert.equal(stats.subjects[0].percentile, 1); // subject dwarfs all controls
+  assert.equal(stats.subjects[0].rank, 1);
+  const bins = histogramBins(metrics, -1000, 1000, 4);
+  assert.equal(bins.reduce((a, b) => a + b.count, 0), 4); // 4 known profits binned
 });
 
 test("fmtUsd formats magnitudes and negatives", () => {

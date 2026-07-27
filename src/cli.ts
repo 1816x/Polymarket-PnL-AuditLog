@@ -857,6 +857,87 @@ async function cmdAnalyze(args: Args): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// control (Phase 5) — random control group. Builds a pool of OTHER wallets
+// trading the same crypto Up/Down markets, ranks the subjects within their
+// PnL distribution (the selection-bias test). Network (resumable) then offline.
+// ---------------------------------------------------------------------------
+async function cmdControl(args: Args): Promise<void> {
+  const { runControl, controlPlan } = await import("./ingest/fetch-control.ts");
+  const { analyzeControl, histogramBins } = await import("./analysis/control.ts");
+  const { histogramSvg, PALETTE } = await import("./report/charts.ts");
+  const db = openDbReadOnly();
+
+  // Control-specific defaults (300 markets, 100 wallets) unless explicitly overridden.
+  const nMarkets = process.argv.includes("--samples") ? args.samples : 300;
+  const nWallets = process.argv.includes("--limit") ? args.limit : 100;
+  if (args.dryRun) {
+    const plan = controlPlan(db, nMarkets);
+    console.log("PHASE 5 — control [dry-run]\n");
+    console.log(`  crypto Up/Down universe (resolved): ${plan.universe.toLocaleString("en-US")} markets`);
+    console.log(`  would sample ${plan.sampledMarkets} markets (${plan.cachedMarkets} cached) → participant pool`);
+    console.log(`  then draw ${nWallets} active wallets and fetch /profit + /volume each`);
+    console.log(`  ≈ ${plan.sampledMarkets - plan.cachedMarkets} + ~200 requests. Writes output/phase5/. No calls made.`);
+    db.close();
+    return;
+  }
+
+  console.log("PHASE 5 — control group (selection-bias test)\n");
+  const res = await runControl(db, {
+    markets: nMarkets,
+    wallets: nWallets,
+    concurrency: args.concurrency,
+    delayMs: args.delayMs,
+    log: stamp,
+  });
+  db.close();
+
+  // Subjects' own Polymarket /profit — the identical metric (from Phase 2 oracle).
+  const lb = JSON.parse(await (await import("node:fs/promises")).readFile("output/phase2/leaderboard-oracle.json", "utf8"));
+  const labelByAddr = new Map((await usableWallets()).map((w) => [w.address as string, w.label]));
+  const subjects = Object.values(lb.wallets as Record<string, { wallet: string; lbProfit: number }>).map((e) => ({
+    label: labelByAddr.get(e.wallet.toLowerCase()) ?? e.wallet.slice(0, 8),
+    wallet: e.wallet.toLowerCase(),
+    profit: e.lbProfit,
+  }));
+
+  const stats = analyzeControl(res.metrics, subjects);
+  const usd = (v: number) => (v < 0 ? "-$" : "$") + Math.abs(v).toLocaleString("en-US", { maximumFractionDigits: 0 });
+  const pct = (v: number) => (100 * v).toFixed(1) + "%";
+
+  hr();
+  console.log(`pool: ${res.poolSize.toLocaleString("en-US")} distinct wallets from ${res.sampledMarkets} markets; ${res.activePool} cleared the ≥${res.minMarkets}-market floor; ${res.drawn} drawn (${stats.n} with a /profit number, ${stats.nUnknown} null).`);
+  console.log(`\ncontrol PnL distribution (Polymarket all-time /profit):`);
+  console.log(`  % profitable: ${pct(stats.pctProfitable)}   population net PnL: ${usd(stats.totalPnl)}`);
+  console.log(`  median ${usd(stats.median)}  mean ${usd(stats.mean)}  p5 ${usd(stats.p5)}  p25 ${usd(stats.p25)}  p75 ${usd(stats.p75)}  p95 ${usd(stats.p95)}`);
+  console.log(`  range [${usd(stats.min)}, ${usd(stats.max)}]   median volume ${stats.medianVolume === null ? "—" : usd(stats.medianVolume)}`);
+  console.log(`\nsubjects vs the control distribution:`);
+  for (const s of stats.subjects.sort((a, b) => b.profit - a.profit)) {
+    console.log(`  ${s.label.padEnd(14)} profit ${usd(s.profit).padStart(12)}  →  ${pct(s.percentile)} percentile (above ${Math.round(s.percentile * stats.n)}/${stats.n} controls)`);
+  }
+
+  // chart: histogram clipped to a readable window, subjects marked
+  const lo = Math.min(stats.p5, -Math.abs(stats.median) - 5000, -20000);
+  const hi = Math.max(stats.p95, 20000);
+  const bins = histogramBins(res.metrics, lo, hi, 30);
+  const markers = stats.subjects.map((s, i) => ({ value: s.profit, label: `${s.label} (${pct(s.percentile)})`, color: PALETTE[i % PALETTE.length] }));
+  const svg = histogramSvg(bins, markers, {
+    title: "Control-group profitability, with the 4 audited wallets marked",
+    subtitle: `${stats.n} random wallets active in the same crypto Up/Down markets · Polymarket all-time profit · clipped to [${usd(lo)}, ${usd(hi)}]`,
+    xLabel: "all-time realized profit (USDC)",
+  });
+
+  await mkdir("output/phase5", { recursive: true });
+  await mkdir("docs/charts", { recursive: true });
+  await writeFile("docs/charts/control-distribution.svg", svg);
+  await writeFile(
+    "output/phase5/control.json",
+    JSON.stringify({ generatedAt: new Date().toISOString(), frame: { sampledMarkets: res.sampledMarkets, poolSize: res.poolSize, activePool: res.activePool, minMarkets: res.minMarkets }, stats, metrics: res.metrics }, null, 1),
+  );
+  console.log(`\n  ↳ wrote output/phase5/control.json + docs/charts/control-distribution.svg`);
+  console.log(`Requests made: ${reqCount()}`);
+}
+
+// ---------------------------------------------------------------------------
 // report (Phase 4) — assemble the final deliverable (docs/report.md + charts).
 // Fully offline: reads the Phase-2/3 artifacts, never the network or the DB.
 // ---------------------------------------------------------------------------
@@ -913,6 +994,8 @@ Usage:
   node src/cli.ts chain-sample [--concurrency N] [--delay MS] [--dry-run] # on-chain receipts
   node src/cli.ts analyze [--wallet 0x..]                # maker/taker, fees, decomposition, stats (offline)
   node src/cli.ts report  [--dry-run]                    # final docs/report.md + SVG charts (offline)
+  node src/cli.ts control [--samples M] [--limit N] [--concurrency N] [--delay MS] [--dry-run]
+                          # Phase 5: random control group (M markets sampled, N wallets drawn)
 
 Environment:
   POLYGON_RPC_URL   optional read-only Polygon RPC (provider key = reliable backfill)
@@ -957,6 +1040,9 @@ async function main(): Promise<void> {
       break;
     case "report":
       await cmdReport(args);
+      break;
+    case "control":
+      await cmdControl(args);
       break;
     case "volume":
       await cmdVolume(args);
