@@ -47,7 +47,8 @@ export interface WalletMetric {
 }
 
 export interface ControlResult {
-  sampledMarkets: number;
+  sampledMarkets: number; // markets successfully read
+  failedMarkets: number; // markets skipped after retries (refetched on re-run)
   poolSize: number; // distinct non-subject wallets found
   activePool: number; // wallets clearing the activity floor
   drawn: number; // control wallets fetched
@@ -99,6 +100,7 @@ export async function runControl(db: Db, opts: ControlOptions = {}): Promise<Con
   const appearances = new Map<string, number>();
   let mi = 0;
   let doneM = 0;
+  let failedM = 0;
   const t0 = Date.now();
   const poolWorker = async (): Promise<void> => {
     for (;;) {
@@ -110,8 +112,18 @@ export async function runControl(db: Db, opts: ControlOptions = {}): Promise<Con
       if (existsSync(path)) {
         wallets = readGz(path) as string[];
       } else {
-        const trades = await getMarketTrades(cid, 500);
-        wallets = [...new Set(trades.map((t) => t.proxyWallet.toLowerCase()))];
+        try {
+          const trades = await getMarketTrades(cid, 500);
+          wallets = [...new Set(trades.map((t) => t.proxyWallet.toLowerCase()))];
+        } catch (e) {
+          // A market that exhausts retries (transient 5xx bursts) is skipped, not
+          // fatal — no cache file is written, so a re-run refetches it. A handful
+          // of skips out of 300 does not bias a participant pool.
+          failedM++;
+          log(`  ⚠ market ${cid.slice(0, 12)}… skipped (${e instanceof Error ? e.message.slice(0, 50) : e})`);
+          await sleep(1500);
+          continue;
+        }
         writeGz(path, wallets);
         if (delayMs > 0) await sleep(delayMs);
       }
@@ -120,9 +132,9 @@ export async function runControl(db: Db, opts: ControlOptions = {}): Promise<Con
         appearances.set(w, (appearances.get(w) ?? 0) + 1);
       }
       doneM++;
-      if (doneM % 50 === 0 || doneM === marketIds.length) {
+      if (doneM % 50 === 0 || doneM === marketIds.length - failedM) {
         const rate = doneM / Math.max((Date.now() - t0) / 1000, 0.001);
-        log(`pool ${doneM}/${marketIds.length} markets · ${appearances.size} distinct wallets · ${rate.toFixed(1)} mkt/s`);
+        log(`pool ${doneM}/${marketIds.length} markets (${failedM} skipped) · ${appearances.size} distinct wallets · ${rate.toFixed(1)} mkt/s`);
       }
     }
   };
@@ -164,7 +176,8 @@ export async function runControl(db: Db, opts: ControlOptions = {}): Promise<Con
 
   metrics.sort((a, b) => (b.profit ?? -Infinity) - (a.profit ?? -Infinity));
   return {
-    sampledMarkets: marketIds.length,
+    sampledMarkets: marketIds.length - failedM,
+    failedMarkets: failedM,
     poolSize: appearances.size,
     activePool: active.length,
     drawn: drawn.length,
