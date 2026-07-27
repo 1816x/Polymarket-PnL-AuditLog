@@ -857,6 +857,26 @@ async function cmdAnalyze(args: Args): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// report (Phase 4) — assemble the final deliverable (docs/report.md + charts).
+// Fully offline: reads the Phase-2/3 artifacts, never the network or the DB.
+// ---------------------------------------------------------------------------
+async function cmdReport(args: Args): Promise<void> {
+  if (args.dryRun) {
+    console.log("PHASE 4 — report [dry-run]");
+    console.log("  reads: output/phase2/{summary.json,daily-pnl.csv,validation.json,leaderboard-oracle.json}");
+    console.log("         output/phase3/{stats,decomposition,maker-taker,fees,feed-gap}.json");
+    console.log("  writes: docs/report.md + docs/charts/*.svg  (fully offline, no DB, no network)");
+    return;
+  }
+  console.log("PHASE 4 — generating final report\n");
+  const { generateReport } = await import("./report/generate.ts");
+  const res = generateReport();
+  console.log(`  ↳ wrote ${res.reportPath}`);
+  for (const c of res.charts) console.log(`  ↳ wrote ${c}`);
+  console.log(`\nDone. ${res.charts.length} charts + report.`);
+}
+
+// ---------------------------------------------------------------------------
 // volume — print the report from the store (pass --sample 0 to skip network)
 // ---------------------------------------------------------------------------
 async function cmdVolume(args: Args): Promise<void> {
@@ -889,6 +909,10 @@ Usage:
   node src/cli.ts pnl     [--dry-run]                    # build derived tables + summaries (offline)
   node src/cli.ts validate [--wallet 0x..] [--samples N] [--delay MS]
   node src/cli.ts explain --market 0x.. [--wallet 0x..]  # one-market ledger dump (offline)
+  node src/cli.ts mt-ingest [--concurrency N] [--delay MS] [--dry-run]  # taker-subset sample (H2)
+  node src/cli.ts chain-sample [--concurrency N] [--delay MS] [--dry-run] # on-chain receipts
+  node src/cli.ts analyze [--wallet 0x..]                # maker/taker, fees, decomposition, stats (offline)
+  node src/cli.ts report  [--dry-run]                    # final docs/report.md + SVG charts (offline)
 
 Environment:
   POLYGON_RPC_URL   optional read-only Polygon RPC (provider key = reliable backfill)
@@ -930,6 +954,9 @@ async function main(): Promise<void> {
       break;
     case "explain":
       await cmdExplain(args);
+      break;
+    case "report":
+      await cmdReport(args);
       break;
     case "volume":
       await cmdVolume(args);

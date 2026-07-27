@@ -12,6 +12,7 @@
     "resolve": "node src/cli.ts resolve",
     "recon": "node src/cli.ts recon",
     "test": "node --test tests/*.test.ts",
+    "report": "node src/cli.ts report",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
