@@ -314,18 +314,25 @@ export interface Marker {
  * lines (the 4 subjects placed in the control distribution). Bars left of zero
  * are losses (red-ish), right are gains (green-ish).
  */
+/** Signed-log transform for heavy-tailed signed data: linear within ±linthresh,
+ *  logarithmic beyond. The right tool when a distribution's mass sits near zero
+ *  but its tail runs to 100×+ (control profits: median ~$100, tail ~$771k). */
+export const signedLog = (v: number, lt = 100): number =>
+  Math.sign(v) * Math.log10(1 + Math.abs(v) / lt);
+
 export function histogramSvg(
   bins: HistBin[],
   markers: Marker[],
-  opts: { title: string; subtitle?: string; xLabel?: string },
+  opts: { title: string; subtitle?: string; xLabel?: string; scale?: (v: number) => number; ticks?: number[] },
 ): string {
-  const f: Frame = { w: 920, h: 460, padL: 56, padR: 24, padT: 84, padB: 62 };
+  const f: Frame = { w: 940, h: 470, padL: 56, padR: 24, padT: 92, padB: 64 };
   const plotW = f.w - f.padL - f.padR;
   const plotH = f.h - f.padT - f.padB;
-  const xLo = Math.min(...bins.map((b) => b.x0), ...markers.map((m) => m.value));
-  const xHi = Math.max(...bins.map((b) => b.x1), ...markers.map((m) => m.value));
+  const tf = opts.scale ?? ((v: number) => v); // value -> axis units
+  const tLo = Math.min(...bins.map((b) => tf(b.x0)), ...markers.map((m) => tf(m.value)));
+  const tHi = Math.max(...bins.map((b) => tf(b.x1)), ...markers.map((m) => tf(m.value)));
   const cMax = Math.max(1, ...bins.map((b) => b.count));
-  const sx = (v: number) => f.padL + ((v - xLo) / Math.max(1e-9, xHi - xLo)) * plotW;
+  const sx = (v: number) => f.padL + ((tf(v) - tLo) / Math.max(1e-9, tHi - tLo)) * plotW;
   const sy = (c: number) => f.padT + plotH - (c / cMax) * plotH;
 
   let g = open(f, opts.title) + titleEl(f, opts.title, opts.subtitle);
@@ -345,32 +352,34 @@ export function histogramSvg(
     g += `<rect x="${n(x)}" y="${n(y)}" width="${n(w)}" height="${n(sy(0) - y)}" rx="1.5" fill="${mid < 0 ? NEG : POS}" fill-opacity="0.55"/>`;
   }
   // zero rule
-  if (xLo < 0 && xHi > 0) {
+  if (tLo < 0 && tHi > 0) {
     const z = sx(0);
     g += `<line x1="${n(z)}" y1="${f.padT}" x2="${n(z)}" y2="${n(sy(0))}" stroke="${MUTED}" stroke-width="1.25"/>`;
     g += text(z, f.padT - 6, "break-even", { anchor: "middle", size: 10, fill: MUTED });
   }
-  // x axis baseline + ticks
+  // x axis baseline + ticks (explicit if provided — needed for a nonlinear scale)
   g += `<line x1="${f.padL}" y1="${n(sy(0))}" x2="${f.padL + plotW}" y2="${n(sy(0))}" stroke="${INK2}" stroke-width="1"/>`;
-  for (let k = 0; k <= 4; k++) {
-    const v = xLo + ((xHi - xLo) * k) / 4;
-    g += text(sx(v), f.h - f.padB + 18, fmtUsd(v), { anchor: "middle", size: 10, fill: MUTED });
+  const ticks = opts.ticks ?? Array.from({ length: 5 }, (_, k) => tLo + ((tHi - tLo) * k) / 4);
+  for (const v of ticks) {
+    const x = sx(v);
+    if (x < f.padL - 1 || x > f.padL + plotW + 1) continue;
+    g += `<line x1="${n(x)}" y1="${n(sy(0))}" x2="${n(x)}" y2="${n(sy(0) + 4)}" stroke="${MUTED}" stroke-width="1"/>`;
+    g += text(x, f.h - f.padB + 18, fmtUsd(v), { anchor: "middle", size: 10, fill: MUTED });
   }
   if (opts.xLabel) g += text(f.padL + plotW / 2, f.h - 8, opts.xLabel, { anchor: "middle", size: 11, fill: INK2 });
 
-  // markers (subjects), staggered labels to avoid overlap
-  const ms = markers.map((m) => ({ ...m, x: sx(m.value) })).sort((a, b) => a.x - b.x);
-  let lastLabelX = -Infinity;
-  let tier = 0;
+  // marker lines on the plot; identities in a stacked key (top-right) so
+  // clustered markers (all 4 subjects sit close on a log axis) never collide.
+  const ms = markers.map((m) => ({ ...m, x: sx(m.value) }));
   for (const m of ms) {
     g += `<line x1="${n(m.x)}" y1="${f.padT - 2}" x2="${n(m.x)}" y2="${n(sy(0))}" stroke="${m.color}" stroke-width="2"/>`;
     g += `<circle cx="${n(m.x)}" cy="${n(f.padT - 2)}" r="3" fill="${m.color}"/>`;
-    // stagger label vertical tier if close to the previous
-    if (m.x - lastLabelX < 90) tier = (tier + 1) % 2;
-    else tier = 0;
-    lastLabelX = m.x;
-    const ly = f.padT + 12 + tier * 16;
-    g += text(m.x + 5, ly, m.label, { size: 10.5, fill: m.color, weight: 700 });
   }
+  const keyRight = f.padL + plotW;
+  [...markers].sort((a, b) => b.value - a.value).forEach((m, i) => {
+    const ky = f.padT + 12 + i * 15;
+    g += `<rect x="${n(keyRight - 132)}" y="${n(ky - 8)}" width="9" height="9" rx="2" fill="${m.color}"/>`;
+    g += text(keyRight - 119, ky, m.label, { size: 10.5, fill: m.color, weight: 700 });
+  });
   return g + "</svg>\n";
 }

@@ -79,9 +79,21 @@ This audit reconstructs PnL from raw public data and then checks it against Poly
 
 One bug this rigor caught: an early PnL pass invented ~$173k of phantom profit from a duplicate-fill key collision + an ingest-ordering gap. It was found *because* the numbers didn't cross-check, root-caused on-chain (the pre-V2 feed omits mint-match legs — confirmed in 80/81 sampled inflow markets), and fixed by rebuilding from the append-only raw cache.
 
+## Selection bias — the control group (H0)
+
+![Control-group profitability with the 4 subjects marked](charts/control-distribution.svg)
+
+The four subjects were **chosen by the article's author, not sampled** — so their profit proves nothing about "the ~1,000 bots" until measured against peers. We drew a random control group of **72** other wallets active in the *same* crypto Up/Down markets (15,399-wallet pool from 300 sampled markets), scored by Polymarket's identical all-time `/profit` metric. The result cuts both ways:
+
+- **The subjects are exceptional, not typical** — they rank at the **96th–100th percentile** (2 of 4 beat *every* control wallet). The article profiled the top of the distribution.
+- **The typical similar bot barely profits** — only **52.8%** of control wallets are profitable, with a **median of $128**. "These bots are profitable" does not generalize.
+- **The edge is real but concentrated** — the pool is net **$1,111,219** with a heavy right tail (p95 $108,569); a minority captures real money. A winner-take-most game, and the subjects are among the winners.
+
+So the article's claim is **half right and misleading as stated**: the strategy *can* be very profitable, but most who run it break even, and the four named wallets are the exceptional top — precisely the survivorship bias this audit set out to test. Full detail: [`docs/phase5-report.md`](phase5-report.md).
+
 ## Limitations (unsoftened)
 
-- **These four wallets were chosen by the article's author, not sampled.** Nothing here generalizes to "the ~1,000 bots" — a random control group is future work (spec §3.6). This is the single most important caveat.
+- **These four wallets were chosen by the article's author, not sampled** — the control group above quantifies exactly how unrepresentative they are (96th–100th percentile). The audit's numbers are correct *for these four*; they are not evidence about the population, which mostly breaks even.
 - **Maker/taker and fees are sample-based** (1,600 markets / 890 receipts, deterministic strata; CIs reported). A fee levied outside `OrderFilled` — none is known — would not appear here, though the cent-level per-market reconciliation bounds any such channel.
 - **Rebates are measured but attributed at the wallet level** (Polymarket's rows carry no market id); they are never mixed into per-market PnL.
 - **The decomposition uses average-cost pairing** (disclosed); FIFO pairing would shift attribution *within* a market but not the totals.

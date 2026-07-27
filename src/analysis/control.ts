@@ -87,3 +87,33 @@ export function histogramBins(
   }
   return bins;
 }
+
+const sgnLog = (v: number, lt: number): number => Math.sign(v) * Math.log10(1 + Math.abs(v) / lt);
+const sgnExp = (y: number, lt: number): number => Math.sign(y) * lt * (10 ** Math.abs(y) - 1);
+
+/**
+ * Histogram bins uniform in SIGNED-LOG space (so they render as equal-width
+ * bars on a symlog axis) — the honest way to show a distribution whose mass is
+ * near zero but whose tail runs to 100×. Bin edges are returned in dollars.
+ */
+export function histogramBinsSigned(
+  metrics: WalletMetric[],
+  nBins = 34,
+  linthresh = 100,
+): Array<{ x0: number; x1: number; count: number }> {
+  const profits = metrics.map((m) => m.profit).filter((p): p is number => p !== null);
+  if (profits.length === 0) return [];
+  const yLo = sgnLog(Math.min(...profits), linthresh);
+  const yHi = sgnLog(Math.max(...profits), linthresh);
+  const step = (yHi - yLo) / nBins || 1;
+  const bins = Array.from({ length: nBins }, (_, i) => ({
+    x0: sgnExp(yLo + i * step, linthresh),
+    x1: sgnExp(yLo + (i + 1) * step, linthresh),
+    count: 0,
+  }));
+  for (const p of profits) {
+    const idx = Math.min(nBins - 1, Math.max(0, Math.floor((sgnLog(p, linthresh) - yLo) / step)));
+    bins[idx].count++;
+  }
+  return bins;
+}

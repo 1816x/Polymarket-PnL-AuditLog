@@ -84,6 +84,13 @@ interface Validation {
 interface Leaderboard {
   wallets: Record<string, { wallet: string; lbProfit: number | null; lbVolume: number | null }>;
 }
+interface Control {
+  frame: { sampledMarkets: number; poolSize: number; activePool: number; minMarkets: number };
+  stats: {
+    n: number; nUnknown: number; pctProfitable: number; median: number; p95: number; totalPnl: number;
+    subjects: Array<{ label: string; profit: number; percentile: number }>;
+  };
+}
 
 const byWallet = <T extends { wallet: string }>(arr: T[]): Map<string, T> => new Map(arr.map((x) => [x.wallet, x]));
 
@@ -118,6 +125,13 @@ export function generateReport(): GenerateResult {
   const feedgap = readJson<FeedGap>(`${P3}/feed-gap.json`);
   const validation = readJson<Validation>(`${P2}/validation.json`);
   const leaderboard = readJson<Leaderboard>(`${P2}/leaderboard-oracle.json`);
+  // Phase 5 is optional — include the control-group section only if it has run.
+  let control: Control | null = null;
+  try {
+    control = JSON.parse(readFileSync("output/phase5/control.json", "utf8")) as Control;
+  } catch {
+    control = null;
+  }
 
   const S = summary.wallets;
   const st = byWallet(stats.wallets);
@@ -343,10 +357,32 @@ export function generateReport(): GenerateResult {
   push(`One bug this rigor caught: an early PnL pass invented ~\$173k of phantom profit from a duplicate-fill key collision + an ingest-ordering gap. It was found *because* the numbers didn't cross-check, root-caused on-chain (the pre-V2 feed omits mint-match legs — confirmed in ${feedgap.wallets.reduce((a, w) => a + w.marketsWithMintEvidence, 0)}/${feedgap.wallets.reduce((a, w) => a + w.marketsSampled, 0)} sampled inflow markets), and fixed by rebuilding from the append-only raw cache.`);
   push();
 
+  // Selection bias — control group (Phase 5, if present)
+  if (control) {
+    const c = control.stats;
+    const top = c.subjects.filter((s) => s.percentile >= 0.999).length;
+    push(`## Selection bias — the control group (H0)`);
+    push();
+    push(`![Control-group profitability with the 4 subjects marked](charts/control-distribution.svg)`);
+    push();
+    push(`The four subjects were **chosen by the article's author, not sampled** — so their profit proves nothing about "the ~1,000 bots" until measured against peers. We drew a random control group of **${c.n}** other wallets active in the *same* crypto Up/Down markets (${control.frame.poolSize.toLocaleString("en-US")}-wallet pool from ${control.frame.sampledMarkets} sampled markets), scored by Polymarket's identical all-time \`/profit\` metric. The result cuts both ways:`);
+    push();
+    push(`- **The subjects are exceptional, not typical** — they rank at the **${(Math.min(...c.subjects.map((s) => s.percentile)) * 100).toFixed(0)}th–100th percentile** (${top} of 4 beat *every* control wallet). The article profiled the top of the distribution.`);
+    push(`- **The typical similar bot barely profits** — only **${pct1(c.pctProfitable)}** of control wallets are profitable, with a **median of ${usdc(c.median)}**. "These bots are profitable" does not generalize.`);
+    push(`- **The edge is real but concentrated** — the pool is net **${usdc(c.totalPnl)}** with a heavy right tail (p95 ${usdc(c.p95)}); a minority captures real money. A winner-take-most game, and the subjects are among the winners.`);
+    push();
+    push(`So the article's claim is **half right and misleading as stated**: the strategy *can* be very profitable, but most who run it break even, and the four named wallets are the exceptional top — precisely the survivorship bias this audit set out to test. Full detail: [\`docs/phase5-report.md\`](phase5-report.md).`);
+    push();
+  }
+
   // Limitations
   push(`## Limitations (unsoftened)`);
   push();
-  push(`- **These four wallets were chosen by the article's author, not sampled.** Nothing here generalizes to "the ~1,000 bots" — a random control group is future work (spec §3.6). This is the single most important caveat.`);
+  if (control) {
+    push(`- **These four wallets were chosen by the article's author, not sampled** — the control group above quantifies exactly how unrepresentative they are (96th–100th percentile). The audit's numbers are correct *for these four*; they are not evidence about the population, which mostly breaks even.`);
+  } else {
+    push(`- **These four wallets were chosen by the article's author, not sampled.** Nothing here generalizes to "the ~1,000 bots" — a random control group is future work (spec §3.6). This is the single most important caveat.`);
+  }
   push(`- **Maker/taker and fees are sample-based** (1,600 markets / 890 receipts, deterministic strata; CIs reported). A fee levied outside \`OrderFilled\` — none is known — would not appear here, though the cent-level per-market reconciliation bounds any such channel.`);
   push(`- **Rebates are measured but attributed at the wallet level** (Polymarket's rows carry no market id); they are never mixed into per-market PnL.`);
   push(`- **The decomposition uses average-cost pairing** (disclosed); FIFO pairing would shift attribution *within* a market but not the totals.`);

@@ -863,8 +863,8 @@ async function cmdAnalyze(args: Args): Promise<void> {
 // ---------------------------------------------------------------------------
 async function cmdControl(args: Args): Promise<void> {
   const { runControl, controlPlan } = await import("./ingest/fetch-control.ts");
-  const { analyzeControl, histogramBins } = await import("./analysis/control.ts");
-  const { histogramSvg, PALETTE } = await import("./report/charts.ts");
+  const { analyzeControl, histogramBinsSigned } = await import("./analysis/control.ts");
+  const { histogramSvg, signedLog, PALETTE } = await import("./report/charts.ts");
   const db = openDbReadOnly();
 
   // Control-specific defaults (300 markets, 100 wallets) unless explicitly overridden.
@@ -915,15 +915,19 @@ async function cmdControl(args: Args): Promise<void> {
     console.log(`  ${s.label.padEnd(14)} profit ${usd(s.profit).padStart(12)}  →  ${pct(s.percentile)} percentile (above ${Math.round(s.percentile * stats.n)}/${stats.n} controls)`);
   }
 
-  // chart: histogram clipped to a readable window, subjects marked
-  const lo = Math.min(stats.p5, -Math.abs(stats.median) - 5000, -20000);
-  const hi = Math.max(stats.p95, 20000);
-  const bins = histogramBins(res.metrics, lo, hi, 30);
-  const markers = stats.subjects.map((s, i) => ({ value: s.profit, label: `${s.label} (${pct(s.percentile)})`, color: PALETTE[i % PALETTE.length] }));
+  // chart: signed-log histogram (mass near zero, tail to the subjects), subjects marked
+  const bins = histogramBinsSigned(res.metrics, 34, 100);
+  const markers = stats.subjects.map((s, i) => {
+    const dl = s.label.startsWith("0x") ? s.label.slice(0, 6) : s.label;
+    return { value: s.profit, label: `${dl} ${usd(s.profit)} (${pct(s.percentile)})`, color: PALETTE[i % PALETTE.length] };
+  });
+  const ticks = [-10000, -1000, -100, 0, 100, 1000, 10000, 100000, 500000];
   const svg = histogramSvg(bins, markers, {
     title: "Control-group profitability, with the 4 audited wallets marked",
-    subtitle: `${stats.n} random wallets active in the same crypto Up/Down markets · Polymarket all-time profit · clipped to [${usd(lo)}, ${usd(hi)}]`,
-    xLabel: "all-time realized profit (USDC)",
+    subtitle: `${stats.n} random wallets active in the same crypto Up/Down markets · Polymarket all-time profit · signed-log axis`,
+    xLabel: "all-time realized profit (USDC) — signed-log scale",
+    scale: (v) => signedLog(v, 100),
+    ticks,
   });
 
   await mkdir("output/phase5", { recursive: true });

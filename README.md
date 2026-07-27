@@ -39,11 +39,17 @@ realized trading PnL plus **$589k** of measured rebates (≈ **$2.29M**), net of
 measured-zero trading fees, reproduced against Polymarket's own accounting to within
 0.1–1.5%.
 
+**...but not representative.** A random control group of similar bots (Phase 5) puts the
+four subjects at the **96th–100th percentile** — the article cherry-picked winners. The
+typical bot in these markets barely profits (median +$128, only 53% profitable), though
+the strategy is genuinely lucrative at the top.
+
 Per the spec's phased workflow (§7), work stopped for review after each phase. Phase
 reports (method detail): **[phase 0](docs/phase0-report.md)** (recon) ·
 **[phase 1](docs/phase1-report.md)** (ingest) · **[phase 2](docs/phase2-report.md)**
 (PnL + validation) · **[phase 3](docs/phase3-report.md)** (hypotheses) ·
-**[final report](docs/report.md)** (Phase 4 synthesis + charts).
+**[phase 5](docs/phase5-report.md)** (control group) · **[final report](docs/report.md)**
+(synthesis + charts).
 
 - **H1 — profitable, statistically.** Every wallet's per-market mean-PnL 95% CI excludes
   zero. Two of four *lose the median market* and profit on the right tail — the edge is
@@ -56,6 +62,9 @@ reports (method detail): **[phase 0](docs/phase0-report.md)** (recon) ·
   remainders lose **−$743k**; only 60–65% of assembled pairs cost < $1 (the article's
   "avg < $1" hides the losing tail); **77k single-leg markets** the pair metric can't see
   net −$53k.
+- **H0 — selection bias confirmed & quantified.** Against 72 random peers on the identical
+  Polymarket `/profit` metric, the four subjects rank 96th–100th percentile; the strategy
+  is net-positive in aggregate but winner-take-most, and the article named the winners.
 - **Trust:** per-market PnL matches Polymarket's own `realizedPnl` to a **$0.015** median;
   the internal ledger closes to ≤ 4e-9 dollars. The one bug this caught (a ~$173k phantom-
   profit key collision) was found *because* the numbers cross-checked, and fixed from the
