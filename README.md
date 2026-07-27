@@ -30,29 +30,36 @@ not an advertisement — see the hard rigor rules in the spec (§8).
   read-only infrastructure, not a wallet key.
 - We are **not** building a bot and **not** trading.
 
-## Status: Phase 3 (analysis) — complete
+## Status: complete — see the [**final report**](docs/report.md)
 
-Per the spec's phased workflow (§7), work stops for review after each phase. Reports:
-**[`docs/phase0-report.md`](docs/phase0-report.md)** (recon),
-**[`docs/phase1-report.md`](docs/phase1-report.md)** (ingest),
-**[`docs/phase2-report.md`](docs/phase2-report.md)** (PnL + validation),
-**[`docs/phase3-report.md`](docs/phase3-report.md)** (hypotheses).
+> **[📊 docs/report.md](docs/report.md)** — verdict-first synthesis with charts. Start here.
 
-Phase 2 headline — **all four auditable wallets are profitable** on a validated
-cash-ledger basis (full life, through 2026-07-25): trading PnL **$1.7M** plus **$589k
-of measured rebates** ≈ **$2.29M total**, reproducing Polymarket's own per-market and
-leaderboard accounting to cents / ±0.07–1.5%.
+**Verdict: all four audited wallets are genuinely profitable** — combined **$1.71M** of
+realized trading PnL plus **$589k** of measured rebates (≈ **$2.29M**), net of
+measured-zero trading fees, reproduced against Polymarket's own accounting to within
+0.1–1.5%.
 
-Phase 3 headline — the result is **statistically solid and mechanically explained**:
-every wallet's per-market mean PnL CI excludes zero; measured trading fees are **0**
-(so the cash figures are net); the four wallets split into two makers (89%/83% maker),
-a taker (82%), and a hybrid; the **paired leg earns everything (+$2.45M) while
-directional remainders lose (−$743k)**; only 60–65% of assembled pairs cost < $1 (the
-article's "avg < $1" hides the losing tail), and single-leg markets the article's
-metric can't see are up to 51% of a wallet's activity. Peak deployed capital:
-**$1.7k–$9.2k per wallet** — high-velocity recycling, not capital intensity. The pre-V2
-"phantom inflow" is closed: 80/80 sampled markets show V1-feed-omitted **mint-match
-legs** on-chain. Remaining: Phase 4 (final synthesis report + charts).
+Per the spec's phased workflow (§7), work stopped for review after each phase. Phase
+reports (method detail): **[phase 0](docs/phase0-report.md)** (recon) ·
+**[phase 1](docs/phase1-report.md)** (ingest) · **[phase 2](docs/phase2-report.md)**
+(PnL + validation) · **[phase 3](docs/phase3-report.md)** (hypotheses) ·
+**[final report](docs/report.md)** (Phase 4 synthesis + charts).
+
+- **H1 — profitable, statistically.** Every wallet's per-market mean-PnL 95% CI excludes
+  zero. Two of four *lose the median market* and profit on the right tail — the edge is
+  skew. Peak deployed capital is only **$1.7k–$9.2k per wallet** — high-velocity
+  recycling, not capital intensity.
+- **H2 — market-making + rewards, not "temporal arbitrage."** Measured trading fees are
+  **0** (so cash-ledger = net PnL); the wallets split into two makers (88%/83%), a taker
+  (82%), and a hybrid; roles validated 380/380 against on-chain `OrderFilled`.
+- **H3 — survivorship bias confirmed.** The paired leg earns **+$2.45M** while directional
+  remainders lose **−$743k**; only 60–65% of assembled pairs cost < $1 (the article's
+  "avg < $1" hides the losing tail); **77k single-leg markets** the pair metric can't see
+  net −$53k.
+- **Trust:** per-market PnL matches Polymarket's own `realizedPnl` to a **$0.015** median;
+  the internal ledger closes to ≤ 4e-9 dollars. The one bug this caught (a ~$173k phantom-
+  profit key collision) was found *because* the numbers cross-checked, and fixed from the
+  append-only raw cache.
 
 Phase 0 (reconnaissance) headline:
 

@@ -87,7 +87,12 @@ interface Leaderboard {
 
 const byWallet = <T extends { wallet: string }>(arr: T[]): Map<string, T> => new Map(arr.map((x) => [x.wallet, x]));
 
-const short = (addr: string): string => addr.slice(0, 6) + "…" + addr.slice(-4);
+/** Compact tag for CHART labels (full labels stay in the markdown tables). Keeps
+ *  address-derived labels short so direct labels don't clip or collide. */
+const disp = (label: string): string => {
+  if (!label.startsWith("0x")) return label; // usernames (pspspsps5, neversmiling) as-is
+  return label.slice(0, 6); // "0xb27bc932…" -> "0xb27b"
+};
 const usdc = (v: number): string => (v < 0 ? "−$" : "$") + Math.abs(v).toLocaleString("en-US", { maximumFractionDigits: 0 });
 const pct1 = (v: number): string => (v * 100).toFixed(1) + "%";
 const dayIndex = (day: string, epoch0: number): number => Math.round((Date.parse(day + "T00:00:00Z") - epoch0) / 86_400_000);
@@ -151,7 +156,7 @@ export function generateReport(): GenerateResult {
       cum += r.cashPnl + r.residValue;
       return { x: dayIndex(r.day, epoch0), y: cum };
     });
-    return { label: w.label, color: colorOf.get(w.wallet)!, points };
+    return { label: disp(w.label), color: colorOf.get(w.wallet)!, points };
   });
   const eqChart = writeChart(
     "equity-curves.svg",
@@ -166,7 +171,7 @@ export function generateReport(): GenerateResult {
         const m = mk.get(w.wallet)!;
         const taker = m.takerShareNotional;
         return {
-          label: w.label,
+          label: disp(w.label),
           segments: [
             { frac: 1 - taker, color: colorOf.get(w.wallet)!, label: `maker ${pct1(1 - taker)}` },
             { frac: taker, color: MUTED, label: `taker ${pct1(taker)}` },
@@ -181,8 +186,8 @@ export function generateReport(): GenerateResult {
   const pdRows = ordered.flatMap((w) => {
     const d = dc.get(w.wallet)!;
     return [
-      { label: `${w.label} · paired`, value: d.pairedPnl, color: POS },
-      { label: `${w.label} · directional`, value: d.directionalPnl, color: NEG },
+      { label: `${disp(w.label)} · paired`, value: d.pairedPnl, color: POS },
+      { label: `${disp(w.label)} · directional`, value: d.directionalPnl, color: NEG },
     ];
   });
   const pdChart = writeChart(
@@ -196,7 +201,7 @@ export function generateReport(): GenerateResult {
     .map((w) => {
       const c = dc.get(w.wallet)!.pairCost!;
       return {
-        label: w.label,
+        label: disp(w.label),
         color: colorOf.get(w.wallet)!,
         p5: c.p5, p25: c.p25, p50: c.p50, p75: c.p75, p95: c.p95,
         note: `${pct1(c.sharePairsUnder1)} of sets < $1`,
@@ -212,7 +217,7 @@ export function generateReport(): GenerateResult {
     "validation.svg",
     groupedBarsSvg(
       ordered.map((w) => ({
-        label: w.label,
+        label: disp(w.label),
         bars: [
           { value: w.resolvedCashPnl + w.resolvedResidValue, color: PALETTE[0], label: fmtUsd(w.resolvedCashPnl + w.resolvedResidValue) },
           { value: lbByAddr.get(w.wallet.toLowerCase()) ?? 0, color: PALETTE[1], label: fmtUsd(lbByAddr.get(w.wallet.toLowerCase()) ?? 0) },

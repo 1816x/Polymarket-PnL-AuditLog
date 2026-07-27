@@ -61,9 +61,11 @@ function open(f: Frame, title: string): string {
 <rect x="0" y="0" width="${f.w}" height="${f.h}" rx="8" fill="${SURFACE}"/>`;
 }
 
+/** Title on line 1, subtitle on its own line below it (left-aligned) — robust
+ *  against long titles, which an inline right-anchored subtitle would collide with. */
 function titleEl(f: Frame, title: string, subtitle?: string): string {
-  let s = `<text x="${f.padL}" y="26" font-size="15" font-weight="700" fill="${INK}">${esc(title)}</text>`;
-  if (subtitle) s += `<text x="${f.w - f.padR}" y="26" font-size="11.5" text-anchor="end" fill="${MUTED}">${esc(subtitle)}</text>`;
+  let s = `<text x="${f.padL}" y="24" font-size="15" font-weight="700" fill="${INK}">${esc(title)}</text>`;
+  if (subtitle) s += `<text x="${f.padL}" y="41" font-size="11.5" fill="${MUTED}">${esc(subtitle)}</text>`;
   return s;
 }
 
@@ -87,7 +89,7 @@ export interface LineSeries {
 
 /** Overlaid cumulative-PnL lines on one shared axis (magnitude comparison is part of the story). */
 export function equityCurveSvg(series: LineSeries[], opts: { title: string; subtitle?: string }): string {
-  const f: Frame = { w: 900, h: 440, padL: 68, padR: 108, padT: 44, padB: 44 };
+  const f: Frame = { w: 920, h: 452, padL: 68, padR: 124, padT: 58, padB: 44 };
   const xs = series.flatMap((s) => s.points.map((p) => p.x));
   const ys = series.flatMap((s) => s.points.map((p) => p.y));
   const xMin = Math.min(...xs);
@@ -116,15 +118,20 @@ export function equityCurveSvg(series: LineSeries[], opts: { title: string; subt
   g += text(f.padL, f.h - 14, `day ${xMin}`, { size: 11, fill: MUTED });
   g += text(f.padL + plotW, f.h - 14, `day ${xMax}`, { anchor: "end", size: 11, fill: MUTED });
 
-  // lines + right-edge direct labels
+  // lines + end markers
+  const ends: Array<{ y: number; x: number; label: string; color: string }> = [];
   for (const s of series) {
     if (s.points.length === 0) continue;
     const d = s.points.map((p, i) => `${i === 0 ? "M" : "L"}${n(sx(p.x))} ${n(sy(p.y))}`).join(" ");
     g += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
     const last = s.points[s.points.length - 1];
     g += `<circle cx="${n(sx(last.x))}" cy="${n(sy(last.y))}" r="3.5" fill="${s.color}"/>`;
-    g += text(sx(last.x) + 7, sy(last.y) + 4, `${s.label} ${fmtUsd(last.y)}`, { size: 11.5, fill: s.color, weight: 700 });
+    ends.push({ y: sy(last.y), x: sx(last.x), label: `${s.label} ${fmtUsd(last.y)}`, color: s.color });
   }
+  // right-edge direct labels, de-collided (min 14px vertical gap)
+  ends.sort((a, b) => a.y - b.y);
+  for (let i = 1; i < ends.length; i++) if (ends[i].y < ends[i - 1].y + 14) ends[i].y = ends[i - 1].y + 14;
+  for (const e of ends) g += text(e.x + 7, e.y + 4, e.label, { size: 11.5, fill: e.color, weight: 700 });
   return g + "</svg>\n";
 }
 
@@ -140,7 +147,7 @@ export interface BarRow {
 /** Horizontal bars that may be negative (diverging around a zero rule). Direct-labeled. */
 export function divergingBarsSvg(rows: BarRow[], opts: { title: string; subtitle?: string; unit?: "usd" }): string {
   const rowH = 40;
-  const f: Frame = { w: 900, h: 60 + rows.length * rowH + 30, padL: 150, padR: 130, padT: 48, padB: 20 };
+  const f: Frame = { w: 920, h: 66 + rows.length * rowH + 30, padL: 176, padR: 130, padT: 58, padB: 20 };
   const plotW = f.w - f.padL - f.padR;
   const vMax = Math.max(1, ...rows.map((r) => Math.abs(r.value)));
   const zeroX = f.padL + (rows.some((r) => r.value < 0) ? plotW / 2 : 0);
@@ -175,19 +182,19 @@ export interface BarGroup {
 }
 export function groupedBarsSvg(groups: BarGroup[], opts: { title: string; subtitle?: string; legend: string[] }): string {
   const groupW = 170;
-  const f: Frame = { w: Math.max(760, 80 + groups.length * groupW), h: 420, padL: 70, padR: 30, padT: 60, padB: 78 };
+  const f: Frame = { w: Math.max(760, 80 + groups.length * groupW), h: 452, padL: 70, padR: 30, padT: 92, padB: 78 };
   const plotW = f.w - f.padL - f.padR;
   const plotH = f.h - f.padT - f.padB;
   const vMax = Math.max(1, ...groups.flatMap((gp) => gp.bars.map((b) => b.value)));
   const sy = (v: number) => f.padT + plotH - (v / vMax) * plotH;
 
   let g = open(f, opts.title) + titleEl(f, opts.title, opts.subtitle);
-  // legend (top-left under title)
+  // legend row (below the 2-line title block)
   let lx = f.padL;
   opts.legend.forEach((lab, i) => {
-    g += `<rect x="${lx}" y="34" width="11" height="11" rx="2.5" fill="${PALETTE[i]}"/>`;
-    g += text(lx + 16, 44, lab, { size: 11.5, fill: INK2 });
-    lx += 22 + lab.length * 7.2;
+    g += `<rect x="${lx}" y="60" width="11" height="11" rx="2.5" fill="${PALETTE[i]}"/>`;
+    g += text(lx + 16, 70, lab, { size: 11.5, fill: INK2 });
+    lx += 26 + lab.length * 7.2;
   });
   // baseline
   g += `<line x1="${f.padL}" y1="${n(sy(0))}" x2="${f.padL + plotW}" y2="${n(sy(0))}" stroke="${MUTED}" stroke-width="1.25"/>`;
@@ -220,7 +227,7 @@ export interface StackRow {
 /** One 0–100% bar per wallet, split into labeled segments (maker vs taker). */
 export function stackedShareSvg(rows: StackRow[], opts: { title: string; subtitle?: string }): string {
   const rowH = 46;
-  const f: Frame = { w: 900, h: 56 + rows.length * rowH + 24, padL: 150, padR: 30, padT: 48, padB: 16 };
+  const f: Frame = { w: 900, h: 64 + rows.length * rowH + 24, padL: 120, padR: 30, padT: 58, padB: 16 };
   const plotW = f.w - f.padL - f.padR;
   let g = open(f, opts.title) + titleEl(f, opts.title, opts.subtitle);
   rows.forEach((r, i) => {
@@ -258,7 +265,7 @@ export interface BoxStat {
 /** Horizontal box-and-whisker per wallet with a $1.00 reference (the H3 blind spot). */
 export function pairCostBoxSvg(boxes: BoxStat[], opts: { title: string; subtitle?: string; refLine: number }): string {
   const rowH = 52;
-  const f: Frame = { w: 900, h: 64 + boxes.length * rowH + 30, padL: 150, padR: 130, padT: 48, padB: 30 };
+  const f: Frame = { w: 900, h: 74 + boxes.length * rowH + 30, padL: 120, padR: 150, padT: 66, padB: 30 };
   const plotW = f.w - f.padL - f.padR;
   const lo = Math.min(opts.refLine, ...boxes.map((b) => b.p5)) * 0.98;
   const hi = Math.max(opts.refLine, ...boxes.map((b) => b.p95)) * 1.02;
